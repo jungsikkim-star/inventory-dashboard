@@ -80,7 +80,7 @@ if uploaded_file:
         main_col_idx = None
         safety_col_idx = None
 
-        date_col_map = {} # {datetime.date: col_index}
+        date_col_map = {}
         inbound_col_info = []
 
         base_year = base_date_input.year
@@ -101,7 +101,7 @@ if uploaded_file:
             elif (("평택" in h or "본창고" in h or "본물류" in h) and "재고" in h and "안전" not in h) and main_col_idx is None:
                 main_col_idx = idx
 
-            # 일일 출고 컬럼 탐색 (0901 ~ 0931 등)
+            # 일일 출고 컬럼 탐색
             match_date = re.search(r"(\d{2})(\d{2})", h)
             if match_date and ("입고" not in h) and ("재고" not in h):
                 m_int = int(match_date.group(1))
@@ -113,7 +113,7 @@ if uploaded_file:
                     except:
                         pass
 
-            # 우측 확정 입고 스케줄 탐색
+            # 우측 입고 스케줄 탐색
             if "입고" in h:
                 m_match = re.search(r"(\d{1,2})월\s*(\d{1,2})일", h)
                 if m_match:
@@ -134,14 +134,13 @@ if uploaded_file:
 
         df_rows = df_rows.loc[valid_indices]
 
-        # 🎯 기준일자(base_date_input) 기준 직전 N일간의 날짜 컬럼만 정확히 선택
+        # 기준일자 직전 N일 날짜 컬럼 추출
         target_calc_dates = []
         for d_back in range(1, int(recent_days_window) + 1):
             check_d = base_date_input - timedelta(days=d_back)
             if check_d in date_col_map:
                 target_calc_dates.append((check_d, date_col_map[check_d]))
 
-        # 만약 전일 데이터가 없으면 기준일 당일 포함 역산
         if not target_calc_dates and (base_date_input in date_col_map):
             target_calc_dates.append((base_date_input, date_col_map[base_date_input]))
 
@@ -157,14 +156,12 @@ if uploaded_file:
             item_main = clean_num(r[main_col_idx]) if main_col_idx is not None else 0.0
             item_safety = clean_num(r[safety_col_idx]) if safety_col_idx is not None else 0.0
 
-            # 정확한 최근 N일 출고 평균(ADU)
             if target_calc_dates:
                 sum_recent_sales = sum([clean_num(r[c_idx]) for _, c_idx in target_calc_dates])
                 adu = sum_recent_sales / float(len(target_calc_dates))
             else:
                 adu = 0.0
 
-            # 우측 입고 스케줄
             inbounds = []
             for ic_idx, m, d in inbound_col_info:
                 qty = clean_num(r[ic_idx])
@@ -197,7 +194,7 @@ if uploaded_file:
 
         view_items = df_items if selected_cat == "전체 보기" else df_items[df_items["구분"] == selected_cat]
 
-        # 3. 🚀 전 품목 대상 "쿠팡 PO 계단식 차감 시뮬레이션" 즉시 연산
+        # 3. 전 품목 시뮬레이션 연산
         sim_days = 90
         sim_dates = [base_date_input + timedelta(days=i) for i in range(sim_days)]
 
@@ -214,42 +211,35 @@ if uploaded_file:
             has_safety = safety > 0
             limit_target = safety if has_safety else 0
 
-            main_breach_day = None # 평택 재고가 바닥나거나 안전재고 밑으로 깨지는 날
+            main_breach_day = None
             first_po_day = None
 
             for d_i in range(sim_days):
                 curr_d = sim_dates[d_i]
 
-                # 우측 입고 확정량 충전
                 for in_d, in_q in inbounds:
                     if in_d == curr_d:
                         c_main += in_q
 
-                # 일일 출고로 VF 차감
                 if adu > 0:
                     c_vf -= adu
 
-                # 쿠팡 발주 트리거 발동
                 if adu > 0 and c_vf < vf_trigger_default:
                     if first_po_day is None:
                         first_po_day = curr_d
 
-                    # 평택에서 MOQ만큼 VF로 이동
                     if c_main >= moq:
                         c_main -= moq
                         c_vf += moq
 
-                        # 안전재고가 있는 경우 안전재고 하향 돌파 감지
                         if has_safety and c_main <= limit_target and main_breach_day is None:
                             main_breach_day = d_i
                     else:
-                        # 평택 재고 완전 고갈
                         if main_breach_day is None:
                             main_breach_day = d_i
                         c_vf += c_main
                         c_main = 0
 
-            # 발주 데드라인 및 D-Day 산출
             if adu == 0:
                 status = "💤 출고없음 (안전)"
                 po_txt = "-"
@@ -287,7 +277,7 @@ if uploaded_file:
                 "납품MOQ": f"{moq:,}개",
                 "안전재고": f"{safety:,}개" if has_safety else "미적용",
                 "일일판매량": f"{adu:.1f}개/일",
-                "차기 쿠팡PO": po_txt,
+                "차기 쿠팡PO예정일": po_txt,
                 "평택재고 고갈일": breach_txt,
                 "공장발주 데드라인": deadline_txt,
                 "발주상태": status,
@@ -296,6 +286,10 @@ if uploaded_file:
             })
 
         summary_df = pd.DataFrame(master_table_rows)
+
+        # 발주상태 우선순위 정렬 후, 번호(인덱스)를 1, 2, 3... 순으로 깔끔하게 재설정
+        sorted_table = summary_df.drop(columns=["raw_name", "d_day_num"]).sort_values(by="발주상태").reset_index(drop=True)
+        sorted_table.index = sorted_table.index + 1  # 1번부터 시작하도록 설정
 
         # KPI
         u_cnt = len(summary_df[summary_df["발주상태"].str.contains("초긴급")])
@@ -308,10 +302,7 @@ if uploaded_file:
         k4.metric("🏭 적용 생산 리드타임", f"{default_lead_time}일 소요")
 
         st.subheader("📋 전체 품목 쿠팡 PO 연동 및 평택창고 발주 데드라인 마스터 테이블")
-        st.dataframe(
-            summary_df.drop(columns=["raw_name", "d_day_num"]).sort_values(by="발주상태"),
-            use_container_width=True
-        )
+        st.dataframe(sorted_table, use_container_width=True)
 
         # 4. 하단 개별 정밀 시뮬레이터 & 그래프
         st.divider()
@@ -331,7 +322,6 @@ if uploaded_file:
         with s4:
             p_safety = st.number_input("안전재고 수량 (0이면 품절기준)", min_value=0, value=int(target_item["안전재고"]), step=100)
 
-        # 상세 시뮬레이션 재실행
         c_main = target_item["평택(본창고)"]
         c_vf = target_item["VF재고"]
         inbound_sched = target_item["입고스케줄"]
@@ -375,7 +365,6 @@ if uploaded_file:
             hist_main.append(c_main)
             hist_vf.append(max(c_vf, 0))
 
-        # 그래프
         st.markdown(f"#### 📈 [{selected_sku}] 향후 60일 평택본창고 vs VF 재고 흐름")
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=sim_dates[:60], y=hist_main[:60], mode="lines+markers", name="평택본창고 (쿠팡 PO 시 계단식 차감)", line=dict(color="#1f77b4", width=3)))
