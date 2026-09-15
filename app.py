@@ -1,447 +1,378 @@
 from datetime import datetime, timedelta
+import re
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="쿠팡 VF & 본창고 통합 발주 관리기")
-st.title("📦 쿠팡 VF & 본창고 유형별 구매발주 최적화 대시보드")
+st.set_page_config(
+    layout="wide", page_title="쿠팡 VF & 평택(본창고) 통합 발주 대시보드"
+)
+st.title("📦 쿠팡 VF & 평택물류 통합 마스터 발주 시스템")
 st.caption(
-    "엑셀 업로드 시 열 이름 자동 매칭 및 쿠팡 PO/본창고 계단식 차감 정밀 시뮬레이션을 제공합니다."
+    "일일 출고량 + 쿠팡 납품 MOQ + 평택/VF 실재고 + 우측 입고 스케줄을 통합하여 안전재고 기반 발주 데드라인을 산출합니다."
 )
 
-# 1. 사이드바 - 파일 업로드 및 기본 설정
+# 1. 사이드바 설정
 st.sidebar.header("📁 엑셀 파일 업로드")
 uploaded_file = st.sidebar.file_uploader(
-    "통합 관리 엑셀 파일 (.xlsx)", type=["xlsx"]
+    "통합 마스터 엑셀 업로드 (.xlsx)", type=["xlsx"]
 )
 
 st.sidebar.divider()
-st.sidebar.header("⚙️ 구매 기준 설정")
-lead_time = st.sidebar.number_input(
-    "기본 구매 리드타임 (일)", min_value=1, max_value=90, value=35
+st.sidebar.header("⚙️ 기본 설정")
+base_date_input = st.sidebar.date_input(
+    "재고 기준일자", datetime(2026, 9, 15).date()
 )
-safety_days = st.sidebar.number_input(
-    "안전재고 버퍼 (일)", min_value=0, max_value=30, value=7
+default_lead_time = st.sidebar.number_input(
+    "기본 구매 리드타임 (일)", min_value=1, max_value=120, value=35
+)
+vf_trigger_default = st.sidebar.number_input(
+    "기본 쿠팡 PO 트리거 (VF 잔여)", min_value=0, value=200, step=10
 )
 
 
-# 스마트 열 탐지 헬퍼 함수
-def find_best_column(columns, candidates):
-  # 1. 완전 일치 또는 강력 일치 우선
-  for cand in candidates:
-    for i, col in enumerate(columns):
-      col_clean = str(col).strip().replace(" ", "").upper()
-      cand_clean = cand.strip().replace(" ", "").upper()
-      if (
-          col_clean == cand_clean
-          or col_clean.startswith(cand_clean)
-          or cand_clean in col_clean
-      ):
-        return i
-  return 0
+# 헤더 텍스트 클리닝 헬퍼
+def clean_txt(val):
+  if pd.isna(val):
+    return ""
+  return str(val).strip().replace("\n", " ").replace(" ", "")
 
 
 if uploaded_file:
   try:
-    excel_file = pd.ExcelFile(uploaded_file)
-    sheet_names = excel_file.sheet_names
+    xl = pd.ExcelFile(uploaded_file)
+    sheet_name = st.sidebar.selectbox("조회할 시트 선택:", xl.sheet_names, index=0)
 
-    st.sidebar.divider()
-    st.sidebar.header("📑 시트 설정")
+    # 헤더 3행을 분석하기 위해 상단 데이터 로드 (header=None)
+    raw_df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
-    # 시트 자동 탐지
-    summary_candidates = [
-        s for s in sheet_names if any(k in s for k in ["요약", "재고", "현황"])
-    ]
-    summary_idx = (
-        sheet_names.index(summary_candidates[0]) if summary_candidates else 0
-    )
-    summary_sheet = st.sidebar.selectbox(
-        "1. 요약 시트:", sheet_names, index=summary_idx
-    )
+    # 1행~3행 헤더 스캔하여 row 1과 row 2 합성 (0-indexed 기준 row 1 = 엑셀 2행, row 2 = 엑셀 3행)
+    header_row_main = 2  # 엑셀의 3행 (0901, 품명 등이 있는 행)
+    for r in range(min(5, len(raw_df))):
+      row_str = " ".join([clean_txt(x) for x in raw_df.iloc[r].values])
+      if "0901" in row_str or "품명" in row_str:
+        header_row_main = r
+        break
 
-    out_candidates = [
-        s for s in sheet_names if any(k in s for k in ["출고", "일일", "고객"])
-    ]
-    out_idx = (
-        sheet_names.index(out_candidates[0])
-        if out_candidates
-        else (1 if len(sheet_names) > 1 else 0)
+    row_upper = (
+        raw_df.iloc[header_row_main - 1] if header_row_main > 0 else None
     )
-    outbound_sheet = st.sidebar.selectbox(
-        "2. 일일 출고량 시트:", sheet_names, index=out_idx
-    )
+    row_lower = raw_df.iloc[header_row_main]
 
-    # 엑셀 데이터 로드 (여백 없앤 1행 기준 기본 로드)
-    df_summary = pd.read_excel(uploaded_file, sheet_name=summary_sheet)
-    df_daily_out = pd.read_excel(uploaded_file, sheet_name=outbound_sheet)
+    combined_cols = []
+    for idx in range(raw_df.shape[1]):
+      u_val = clean_txt(row_upper[idx]) if row_upper is not None else ""
+      l_val = clean_txt(row_lower[idx])
+      comb = f"{u_val}_{l_val}".strip("_")
+      combined_cols.append(comb if comb else f"COL_{idx}")
 
-    # 헤더가 2행에 남아있는 경우 대비 자동 헤더 보정
-    if any(str(c).startswith("Unnamed") for c in df_summary.columns[:3]):
-      df_summary = pd.read_excel(
-          uploaded_file, sheet_name=summary_sheet, header=1
-      )
-    if any(str(c).startswith("Unnamed") for c in df_daily_out.columns[:3]):
-      df_daily_out = pd.read_excel(
-          uploaded_file, sheet_name=outbound_sheet, header=1
-      )
+    df_data = raw_df.iloc[header_row_main + 1 :].copy()
+    df_data.columns = combined_cols
 
-    df_summary.columns = [str(c).strip() for c in df_summary.columns]
-    df_daily_out.columns = [str(c).strip() for c in df_daily_out.columns]
+    # 핵심 컬럼 자동 식별
+    sku_col = None
+    category_col = None
+    moq_col = None
+    vf_col = None
+    main_col = None
+    safety_col = None
 
-    df_summary = df_summary.dropna(how="all")
-    df_daily_out = df_daily_out.dropna(how="all")
+    date_cols = []
+    inbound_cols = []  # (컬럼명, 입고월, 입고일)
 
-    st.sidebar.divider()
-    st.sidebar.header("🏷️ 열 매칭 (자동 감지 완료)")
+    for c in df_data.columns:
+      c_clean = c.replace(" ", "")
 
-    # 1) 요약 시트 열 자동 매칭
-    sku_idx = find_best_column(
-        df_summary.columns, ["품명", "상품명", "SKU", "품목", "상품", "품목명"]
-    )
-    sku_col = st.sidebar.selectbox(
-        "[요약] 품명/SKU 열:", df_summary.columns, index=sku_idx
-    )
+      # 품명 컬럼
+      if "품명" in c_clean and not sku_col:
+        sku_col = c
+      # 구분/유형
+      elif any(k in c_clean for k in ["구분", "유형", "카테고리"]) and not category_col:
+        category_col = c
+      # 납품 MOQ
+      elif "MOQ" in c_clean.upper() or "1회" in c_clean:
+        moq_col = c
+      # VF 재고
+      elif "VF" in c_clean.upper() and ("재고" in c_clean or "수량" in c_clean):
+        vf_col = c
+      # 본창고/평택 재고
+      elif (
+          any(k in c_clean for k in ["평택", "본창고", "본물류"])
+          and "재고" in c_clean
+      ):
+        main_col = c
+      # 안전재고
+      elif "안전재고" in c_clean:
+        safety_col = c
 
-    main_idx = find_best_column(
-        df_summary.columns,
-        ["본물류", "본창고", "본물류재고", "본창고재고", "물류재고", "본", "창고"],
-    )
-    main_col = st.sidebar.selectbox(
-        "[요약] 본창고 재고 열:", df_summary.columns, index=main_idx
-    )
+      # 0901, 0902 등 일자별 출고 컬럼 (4자리 숫자 패턴)
+      if re.search(r"\b09\d{2}\b", c_clean) or re.search(r"_\d{4}$", c_clean):
+        date_cols.append(c)
 
-    vf_idx = find_best_column(
-        df_summary.columns,
-        ["VF잔여", "VF재고", "VF", "플렉스", "벤더플렉스", "쿠팡재고"],
-    )
-    vf_col = st.sidebar.selectbox(
-        "[요약] VF 재고 열:", df_summary.columns, index=vf_idx
-    )
+      # 우측 입고 컬럼 (헤더에 '입고일:' 또는 '월'이 들어있는 패턴)
+      if "입고일" in c or "입고" in c:
+        match = re.search(r"(\d{1,2})월\s*(\d{1,2})일", c)
+        if match:
+          inbound_cols.append((c, int(match.group(1)), int(match.group(2))))
 
-    po_qty_idx = find_best_column(
-        df_summary.columns,
-        ["1회발주량", "1회발주", "1회", "PO수량", "발주단위", "파렛트", "배치"],
-    )
-    # 해당되는 컬럼이 없으면 (없음) 선택
-    po_has_match = any(
-        k in str(df_summary.columns[po_qty_idx])
-        for k in ["1회", "발주", "PO", "단위", "파렛트"]
-    )
-    po_options = ["(없음 - 출고량 기반 계산)"] + list(df_summary.columns)
-    po_qty_col = st.sidebar.selectbox(
-        "[요약] 1회 발주량 열:",
-        po_options,
-        index=(po_qty_idx + 1) if po_has_match else 0,
-    )
+    # 품명 컬럼이 없는 경우 대비 보정
+    if not sku_col:
+      sku_col = df_data.columns[1]
 
-    inc_idx = find_best_column(
-        df_summary.columns,
-        ["입고예정", "매입예정", "입고대기", "입고예정량", "발주예정"],
-    )
-    inc_has_match = any(
-        k in str(df_summary.columns[inc_idx])
-        for k in ["입고", "매입", "대기", "예정"]
-    ) and df_summary.columns[inc_idx] != (
-        po_qty_col if po_has_match else ""
-    )
-    inc_options = ["(없음 - 0으로 계산)"] + list(df_summary.columns)
-    incoming_col = st.sidebar.selectbox(
-        "[요약] 입고 예정량 열:",
-        inc_options,
-        index=(inc_idx + 1) if inc_has_match else 0,
-    )
-
-    # 2) 출고 시트 열 자동 매칭
-    sku_out_idx = find_best_column(
-        df_daily_out.columns,
-        ["품명", "상품명", "SKU", "품목", "상품", "품목명"],
-    )
-    sku_out_col = st.sidebar.selectbox(
-        "[출고] 품명/SKU 열:", df_daily_out.columns, index=sku_out_idx
-    )
-
-    type_out_idx = find_best_column(
-        df_daily_out.columns, ["유형", "카테고리", "분류", "구분", "종류"]
-    )
-    type_out_col = st.sidebar.selectbox(
-        "[출고] 유형(카테고리) 열:", df_daily_out.columns, index=type_out_idx
-    )
-
-    # 출고 일자 컬럼 자동 분리
-    non_date_cols = [sku_out_col, type_out_col, "평균", "합계", "비고"]
-    date_cols = [
-        c
-        for c in df_daily_out.columns
-        if c not in non_date_cols and not str(c).startswith("Unnamed")
+    # 결측 행 제거 (품명이 없거나 합계 행 제거)
+    df_data = df_data[df_data[sku_col].notna()]
+    df_data = df_data[
+        ~df_data[sku_col].astype(str).str.contains("합계|평균|비고", na=False)
     ]
 
-    # 데이터 정제
-    df_summary = df_summary[
-        df_summary[sku_col].notna() & (df_summary[sku_col] != "nan")
-    ]
-    df_daily_out = df_daily_out[
-        df_daily_out[sku_out_col].notna() & (df_daily_out[sku_out_col] != "nan")
-    ]
+    # 숫자 데이터 정제 함수
+    def clean_num(val):
+      if pd.isna(val) or str(val).strip() in ["-", "", "#DIV/0!", "전량"]:
+        return 0
+      try:
+        return float(str(val).replace(",", "").strip())
+      except:
+        return 0
 
-    df_summary[main_col] = (
-        pd.to_numeric(df_summary[main_col], errors="coerce").fillna(0).astype(int)
-    )
-    df_summary[vf_col] = (
-        pd.to_numeric(df_summary[vf_col], errors="coerce").fillna(0).astype(int)
-    )
+    # 숫자형 변환
+    if moq_col:
+      df_data[moq_col] = df_data[moq_col].apply(clean_num)
+    if vf_col:
+      df_data[vf_col] = df_data[vf_col].apply(clean_num)
+    if main_col:
+      df_data[main_col] = df_data[main_col].apply(clean_num)
+    if safety_col:
+      df_data[safety_col] = df_data[safety_col].apply(clean_num)
 
-    if po_qty_col != "(없음 - 출고량 기반 계산)":
-      df_summary["기본_1회발주량"] = (
-          pd.to_numeric(df_summary[po_qty_col], errors="coerce")
-          .fillna(0)
-          .astype(int)
-      )
+    # 일일 출고량 숫자 변환 및 일평균 출고량(ADU) 계산
+    for dc in date_cols:
+      df_data[dc] = df_data[dc].apply(clean_num)
+
+    if date_cols:
+      df_data["일평균출고"] = df_data[date_cols].mean(axis=1)
     else:
-      df_summary["기본_1회발주량"] = 0
+      df_data["일평균출고"] = 0.0
 
-    if incoming_col != "(없음 - 0으로 계산)":
-      df_summary["입고예정량"] = (
-          pd.to_numeric(df_summary[incoming_col], errors="coerce")
-          .fillna(0)
-          .astype(int)
-      )
-    else:
-      df_summary["입고예정량"] = 0
-
-    for c in date_cols:
-      df_daily_out[c] = pd.to_numeric(df_daily_out[c], errors="coerce")
-
-    # 최근 일평균 출고량 계산
-    df_daily_out["계산_일평균출고"] = (
-        df_daily_out[date_cols].mean(axis=1, skipna=True).fillna(0)
-    )
-
-    # 데이터 병합
-    merged = pd.merge(
-        df_summary,
-        df_daily_out[[sku_out_col, type_out_col, "계산_일평균출고"]],
-        left_on=sku_col,
-        right_on=sku_out_col,
-        how="left",
-    ).fillna({"계산_일평균출고": 0, type_out_col: "기타"})
-
-    # 재고 및 소진일 계산
-    merged["현재가용재고"] = merged[main_col] + merged[vf_col]
-    merged["입고반영_총재고"] = merged["현재가용재고"] + merged["입고예정량"]
-
-    merged["현재재고_소진일"] = np.where(
-        merged["계산_일평균출고"] > 0,
-        merged["현재가용재고"] / merged["계산_일평균출고"],
-        999,
-    )
-    merged["입고반영_최종소진일"] = np.where(
-        merged["계산_일평균출고"] > 0,
-        merged["입고반영_총재고"] / merged["계산_일평균출고"],
-        999,
-    )
-    merged["발주여유일(D-Day)"] = (
-        merged["입고반영_최종소진일"] - lead_time - safety_days
-    )
-
-    today = datetime.today().date()
-
-    def evaluate_status(d_day, cur_days, in_qty):
-      if cur_days <= lead_time and in_qty == 0:
-        return "🚨 [초긴급] 품절위험 (즉시발주)"
-      elif cur_days <= lead_time and in_qty > 0:
-        return f"🚚 입고대기중 (차기발주 D-{max(int(d_day), 0)})"
-      elif d_day <= 0:
-        return "🔥 [긴급] 오늘 차기발주 필요"
-      elif d_day <= 7:
-        return f"⚠️ [준비] 차기발주 D-{int(d_day)}"
-      else:
-        return f"✅ [안정] 차기발주 D-{int(d_day)}"
-
-    merged["발주상태"] = merged.apply(
-        lambda r: evaluate_status(
-            r["발주여유일(D-Day)"],
-            r["현재재고_소진일"],
-            r["입고예정량"],
-        ),
-        axis=1,
-    )
+    # 우측 입고 컬럼 숫자 변환
+    for ic, m, d in inbound_cols:
+      df_data[ic] = df_data[ic].apply(clean_num)
 
     # 2. 상단 카테고리(유형) 필터
     st.divider()
-    all_types = ["전체 보기"] + list(merged[type_out_col].dropna().unique())
-    selected_type = st.selectbox(
-        "📂 조회할 품목 유형(카테고리)을 선택하세요:", all_types
-    )
+    if category_col:
+      all_types = ["전체 보기"] + list(
+          df_data[category_col].dropna().unique()
+      )
+      selected_type = st.selectbox(
+          "📂 조회할 구분(유형) 선택:", all_types
+      )
+      if selected_type != "전체 보기":
+        filtered_df = df_data[df_data[category_col] == selected_type]
+      else:
+        filtered_df = df_data
+    else:
+      filtered_df = df_data
 
-    filtered_df = (
-        merged
-        if selected_type == "전체 보기"
-        else merged[merged[type_out_col] == selected_type]
-    )
+    # 전체 요약 표 계산
+    records = []
+    for idx, row in filtered_df.iterrows():
+      sku_name = str(row[sku_col]).strip()
+      moq = int(row[moq_col]) if moq_col else 100
+      vf_stock = int(row[vf_col]) if vf_col else 0
+      main_stock = int(row[main_col]) if main_col else 0
+      safety_stock = int(row[safety_col]) if safety_col else 0
+      adu = float(row["일평균출고"])
 
-    # 3. 요약 KPI 카드
-    urgent_cnt = len(
-        filtered_df[filtered_df["발주상태"].str.contains("초긴급|오늘")]
-    )
-    inbound_cnt = len(
-        filtered_df[filtered_df["발주상태"].str.contains("입고대기중")]
-    )
-    warning_cnt = len(filtered_df[filtered_df["발주상태"].str.contains("준비")])
+      # 총 가용 재고
+      tot_stock = vf_stock + main_stock
+
+      # 안전재고 적용 여부 (숫자가 0보다 크면 안전재고 기준, 0이면 원래대로 품절 0개 기준)
+      has_safety = safety_stock > 0
+      target_limit = safety_stock if has_safety else 0
+
+      # 단순 계산 일수
+      days_to_target = (
+          max((tot_stock - target_limit) / adu, 0.0) if adu > 0 else 999
+      )
+      d_day = days_to_target - default_lead_time
+
+      if tot_stock <= target_limit:
+        status = "🚨 [초긴급] 마지노선 붕괴 (즉시발주)"
+      elif d_day <= 0:
+        status = "🔥 [긴급] 오늘 발주 필요"
+      elif d_day <= 7:
+        status = f"⚠️ [주의] D-{int(d_day)}일 내 발주"
+      else:
+        status = f"✅ [안정] D-{int(d_day)}일 여유"
+
+      records.append({
+          "품명": sku_name,
+          "평택(본창고)": main_stock,
+          "VF재고": vf_stock,
+          "납품MOQ": moq,
+          "안전재고": f"{safety_stock:,}개" if has_safety else "미적용",
+          "일출고량": f"{adu:.1f}개/일",
+          "목표도달소진일": (
+              f"{days_to_target:.1f}일" if days_to_target < 900 else "-"
+          ),
+          "발주상태": status,
+          "raw_sku": sku_name,
+          "d_day_num": d_day,
+      })
+
+    summary_res_df = pd.DataFrame(records)
+
+    # KPI 지표
+    u_cnt = len(summary_res_df[summary_res_df["발주상태"].str.contains("초긴급|오늘")])
+    w_cnt = len(summary_res_df[summary_res_df["발주상태"].str.contains("주의")])
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("선택 유형", f"{selected_type}")
-    k2.metric("🚨 즉시 발주 필요", f"{urgent_cnt} 개 SKU")
-    k3.metric("🚚 입고 대기 진행 중", f"{inbound_cnt} 개 SKU")
-    k4.metric("⚠️ 7일 내 차기발주", f"{warning_cnt} 개 SKU")
+    k1.metric("기준 일자", base_date_input.strftime("%Y-%m-%d"))
+    k2.metric("🚨 즉시 발주 필요", f"{u_cnt} 개 SKU")
+    k3.metric("⚠️ 이번 주 발주 검토", f"{w_cnt} 개 SKU")
+    k4.metric("📦 총 관리 SKU", f"{len(summary_res_df)} 개")
 
-    # 4. 유형별 전체 품목 일괄 비교 테이블
-    st.subheader(f"📋 [{selected_type}] 전체 품목 발주 현황 일괄 비교표")
-
-    view_cols = [
-        sku_col,
-        type_out_col,
-        main_col,
-        vf_col,
-        "기본_1회발주량",
-        "입고예정량",
-        "입고반영_총재고",
-        "계산_일평균출고",
-        "현재재고_소진일",
-        "입고반영_최종소진일",
-        "발주상태",
-    ]
-    view_df = filtered_df[view_cols].copy()
-    view_df = view_df.rename(
-        columns={
-            sku_col: "품명",
-            type_out_col: "유형",
-            main_col: "본창고재고",
-            vf_col: "VF재고",
-            "기본_1회발주량": "1회발주량(기준)",
-            "계산_일평균출고": "일평균출고량",
-            "현재재고_소진일": "현재재고 소진일",
-            "입고반영_최종소진일": "입고반영 최종소진일",
-        }
+    st.subheader("📋 전체 품목 발주 현황 마스터 테이블")
+    st.dataframe(
+        summary_res_df.drop(columns=["raw_sku", "d_day_num"]).sort_values(
+            by="발주상태"
+        ),
+        use_container_width=True,
     )
 
-    view_df["현재재고 소진일"] = view_df["현재재고 소진일"].apply(
-        lambda x: f"{x:.1f}일" if x < 900 else "내역없음"
-    )
-    view_df["입고반영 최종소진일"] = view_df["입고반영 최종소진일"].apply(
-        lambda x: f"{x:.1f}일" if x < 900 else "내역없음"
-    )
-    view_df["일평균출고량"] = view_df["일평균출고량"].apply(
-        lambda x: f"{x:.1f}개/일"
-    )
-
-    st.dataframe(view_df.sort_values(by="발주상태"), use_container_width=True)
-
-    # 5. 하단: 개별 SKU 선택 후 정밀 쿠팡 PO & 계단식 차감 시뮬레이션
+    # 3. 개별 품목 정밀 시뮬레이션 (우측 입고일정 완벽 반영)
     st.divider()
-    st.subheader("🔍 개별 SKU 쿠팡 PO 연동 & 본창고 계단식 차감 시뮬레이터")
-
-    target_sku = st.selectbox(
-        "정밀 시뮬레이션할 품목을 선택하세요:",
-        filtered_df[sku_col].unique(),
+    st.subheader(
+        "🔍 개별 SKU 정밀 시뮬레이터 (쿠팡 PO 연동 + 우측 입고 스케줄 자동 반영)"
     )
-    item = filtered_df[filtered_df[sku_col] == target_sku].iloc[0]
 
-    base_po = int(item["기본_1회발주량"])
-    if base_po == 0:
-      base_po = (
-          int(item["계산_일평균출고"] * 3)
-          if item["계산_일평균출고"] > 0
-          else 320
-      )
+    selected_target = st.selectbox(
+        "정밀 시뮬레이션할 품목 선택:", summary_res_df["raw_sku"].unique()
+    )
+    target_row = filtered_df[
+        filtered_df[sku_col].astype(str).str.strip() == selected_target
+    ].iloc[0]
 
-    p1, p2, p3, p4 = st.columns(4)
-    with p1:
-      vf_trigger = st.number_input(
-          "쿠팡 발주 트리거 (VF 잔여 기준)",
+    base_moq = int(target_row[moq_col]) if moq_col else 100
+    if base_moq <= 0:
+      base_moq = 100
+
+    sim_c1, sim_c2, sim_c3, sim_c4 = st.columns(4)
+    with sim_c1:
+      sim_vf_trig = st.number_input(
+          "쿠팡 발주 트리거 (VF 잔여)",
           min_value=0,
-          value=200,
+          value=int(vf_trigger_default),
           step=10,
-          help="VF 재고가 이 수량 미만이면 쿠팡 PO 발생",
       )
-    with p2:
-      po_multiplier = st.selectbox(
-          "쿠팡 PO 발주 배수 (성수기/급증 대응)",
+    with sim_c2:
+      sim_multiplier = st.selectbox(
+          "쿠팡 PO 발주 배수",
           [1, 2, 3],
-          format_func=lambda x: f"{x}배수 ({base_po * x:,}개)",
-          help="평상시는 1배수, 행사/성수기에는 2배수로 발주가 터질 때를 시뮬레이션합니다.",
+          format_func=lambda x: f"{x}배수 ({base_moq * x:,}개)",
       )
-      po_batch_qty = base_po * po_multiplier
-
-    with p3:
-      sim_adu = st.number_input(
+      cur_po_unit = base_moq * sim_multiplier
+    with sim_c3:
+      sim_adu_input = st.number_input(
           "일평균 고객 출고량 (개/일)",
           min_value=0.0,
-          value=float(item["계산_일평균출고"]),
+          value=float(target_row["일평균출고"]),
           step=1.0,
       )
-    with p4:
-      incoming_val = st.number_input(
-          "입고 예정 수량 (개)",
+    with sim_c4:
+      sim_safety_input = st.number_input(
+          "안전재고 수량 (0이면 원래대로)",
           min_value=0,
-          value=int(item["입고예정량"]),
+          value=int(target_row[safety_col]) if safety_col else 0,
           step=100,
       )
-      incoming_eta_days = st.number_input(
-          "입고 예정일 (며칠 뒤 입고?)",
-          min_value=0,
-          max_value=90,
-          value=7,
-      )
 
-    # 90일 정밀 시뮬레이션 연산
+    # 해당 품목의 우측 시트 입고 스케줄 추출
+    sku_inbound_schedule = []  # (입고날짜 datetime.date, 수량)
+    for ic, m, d in inbound_cols:
+      val = target_row[ic]
+      if val > 0:
+        # 연도 추정 (9월 이전이면 2027년, 9월 이후면 2026년)
+        year = (
+            base_date_input.year
+            if m >= base_date_input.month
+            else base_date_input.year + 1
+        )
+        in_date = datetime(year, m, d).date()
+        if in_date >= base_date_input:
+          sku_inbound_schedule.append((in_date, int(val)))
+
+    sku_inbound_schedule.sort(key=lambda x: x[0])
+
+    # 90일 시뮬레이션
     sim_days = 90
-    sim_dates = [today + timedelta(days=i) for i in range(sim_days)]
+    sim_dates = [base_date_input + timedelta(days=i) for i in range(sim_days)]
 
-    curr_main = item[main_col]
-    curr_vf = item[vf_col]
+    curr_main = int(target_row[main_col]) if main_col else 0
+    curr_vf = int(target_row[vf_col]) if vf_col else 0
 
     hist_main = []
     hist_vf = []
-    po_log = []
-    main_stockout_day = None
+    po_logs = []
+
+    target_breach_day = None
     first_po_date = None
 
     for day_idx in range(sim_days):
-      if incoming_val > 0 and day_idx == incoming_eta_days:
-        curr_main += incoming_val
-        po_log.append((
-            sim_dates[day_idx],
-            f"🚚 [본창고 입고완료] +{incoming_val:,}개 충전",
-            curr_main,
-            curr_vf,
-        ))
+      today_date = sim_dates[day_idx]
 
-      if sim_adu > 0:
-        curr_vf -= sim_adu
+      # 1) 우측 스케줄상 오늘 입고되는 물량이 있다면 평택(본창고)에 자동 충전
+      for in_date, in_qty in sku_inbound_schedule:
+        if in_date == today_date:
+          curr_main += in_qty
+          po_logs.append((
+              today_date,
+              f"🚚 [입고 스케줄 반영] +{in_qty:,}개 평택본창고 입고 완료",
+              curr_main,
+              curr_vf,
+          ))
 
-      if sim_adu > 0 and curr_vf < vf_trigger:
+      # 2) 일일 출고
+      if sim_adu_input > 0:
+        curr_vf -= sim_adu_input
+
+      # 3) 쿠팡 PO 발생 체크
+      if sim_adu_input > 0 and curr_vf < sim_vf_trig:
         if first_po_date is None:
-          first_po_date = sim_dates[day_idx]
+          first_po_date = today_date
 
-        if curr_main >= po_batch_qty:
-          curr_main -= po_batch_qty
-          curr_vf += po_batch_qty
-          po_log.append((
-              sim_dates[day_idx],
-              f"📦 쿠팡 PO 발주 -> 본창고 {po_batch_qty:,}개 차감 (정상 이동)",
+        if curr_main >= cur_po_unit:
+          curr_main -= cur_po_unit
+          curr_vf += cur_po_unit
+
+          # 안전재고가 있는 경우 안전재고 하향 돌파 감지
+          if (
+              sim_safety_input > 0
+              and curr_main <= sim_safety_input
+              and target_breach_day is None
+          ):
+            target_breach_day = day_idx
+
+          po_logs.append((
+              today_date,
+              (
+                  f"📦 쿠팡 PO {cur_po_unit:,}개 발생 ➔ 평택창고 차감 (잔여:"
+                  f" {curr_main:,}개)"
+              ),
               curr_main,
               curr_vf,
           ))
         else:
-          if main_stockout_day is None:
-            main_stockout_day = day_idx
-          po_log.append((
-              sim_dates[day_idx],
+          # 평택창고 결품!
+          if target_breach_day is None:
+            target_breach_day = day_idx
+
+          po_logs.append((
+              today_date,
               (
-                  f"🚨 [본창고 결품!] PO {po_batch_qty:,}개 중 잔여 {curr_main:,}개만"
-                  " 이동"
+                  f"🚨 [평택창고 결품/부족!] PO {cur_po_unit:,}개 중 잔여 {curr_main:,}개만"
+                  " VF로 이동"
               ),
               0,
               curr_vf + curr_main,
@@ -452,75 +383,68 @@ if uploaded_file:
       hist_main.append(curr_main)
       hist_vf.append(max(curr_vf, 0))
 
-    # 본창고 결품일 및 발주 데드라인 계산
-    if sim_adu == 0:
-      stockout_str = "출고량 없음 (안전)"
-      stockout_delta = None
-      deadline_str = "발주 불필요"
-      d_day_sim = 999
-    elif main_stockout_day is None:
-      stockout_str = "90일 이상 안전"
-      stockout_delta = None
-      deadline_str = "90일 이후"
-      d_day_sim = 999
-    else:
-      stockout_date = sim_dates[main_stockout_day]
-      stockout_str = f"{stockout_date.strftime('%Y-%m-%d')}"
-      stockout_delta = f"D+{main_stockout_day}일 고갈"
-      order_deadline = stockout_date - timedelta(days=(lead_time + safety_days))
-      deadline_str = order_deadline.strftime("%Y-%m-%d")
-      d_day_sim = (order_deadline - today).days
+    # 결과 산출
+    is_safety_mode = sim_safety_input > 0
+    mode_name = "안전재고선 붕괴일" if is_safety_mode else "평택창고 품절(0개)일"
 
-    # 실시간 연산 결과 카드
+    if sim_adu_input == 0:
+      breach_str = "출고량 없음"
+      deadline_str = "발주 불필요"
+      d_day_num = 999
+    elif target_breach_day is None:
+      breach_str = "90일 이상 안전"
+      deadline_str = "여유"
+      d_day_num = 999
+    else:
+      b_date = sim_dates[target_breach_day]
+      breach_str = f"{b_date.strftime('%Y-%m-%d')} (D+{target_breach_day}일)"
+      d_line = b_date - timedelta(days=default_lead_time)
+      deadline_str = d_line.strftime("%Y-%m-%d")
+      d_day_num = (d_line - base_date_input).days
+
+    # 실시간 카드
     st.markdown("---")
-    st.markdown("#### 🎯 실시간 시뮬레이션 연산 결과")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(
-        "시작 가용 재고",
-        f"총 {item[main_col] + item[vf_col]:,}개",
-        f"본창고 {item[main_col]:,} / VF {item[vf_col]:,}",
+    res1, res2, res3, res4 = st.columns(4)
+    res1.metric(
+        "기준 재고 (09/15)",
+        f"평택 {int(target_row[main_col]):,}개 / VF {int(target_row[vf_col]):,}개",
+        f"안전재고: {sim_safety_input:,}개" if is_safety_mode else "미적용",
     )
-    m2.metric(
+    res2.metric(
         "다음 쿠팡 PO 예상일",
-        f"{first_po_date.strftime('%Y-%m-%d')}"
-        if first_po_date
-        else "발주조건 미달",
-        f"적용 PO 단위: {po_batch_qty:,}개 ({po_multiplier}배수)",
+        f"{first_po_date.strftime('%m/%d')}" if first_po_date else "조건 미달",
+        f"1회 납품MOQ: {cur_po_unit:,}개",
     )
-    m3.metric(
-        "본창고 결품(재고소진) 예정일",
-        f"{stockout_str}",
-        stockout_delta,
-        delta_color="inverse",
+    res3.metric(
+        f"{mode_name}",
+        f"{breach_str}",
+        f"예정 입고 {len(sku_inbound_schedule)}건 스케줄 반영됨",
     )
-    m4.metric(
+    res4.metric(
         "구매팀 발주 요청 데드라인",
         f"{deadline_str}",
-        f"D-Day {d_day_sim}일" if d_day_sim < 900 else None,
+        f"D-Day {d_day_num}일" if d_day_num < 900 else None,
         delta_color="inverse",
     )
 
-    if sim_adu > 0:
-      if d_day_sim <= 0:
+    # 안내 배너
+    if sim_adu_input > 0:
+      if d_day_num <= 0:
         st.error(
-            f"🚨 **[초긴급 구매발주]** 리드타임({lead_time}일) 감안 시, **오늘 즉시 구매팀에 발주 요청**해야 {stockout_str} 본창고 결품을 막을 수 있습니다!"
+            f"🚨 **[초긴급 구매발주]** 리드타임({default_lead_time}일) 고려 시, **오늘 즉시 발주 요청**해야 {mode_name}({breach_str})을 막을 수 있습니다!"
         )
-      elif d_day_sim <= 7:
+      elif d_day_num <= 7:
         st.warning(
-            f"⚠️ **[발주 준비 구간]** 구매팀 발주 데드라인({deadline_str})까지 **{d_day_sim}일** 남았습니다. 사전 검토를 진행하세요."
+            f"⚠️ **[발주 준비]** 구매 데드라인({deadline_str})까지 **{d_day_num}일** 남았습니다."
         )
       else:
         st.success(
-            f"✅ **[재고 안정]** 입고 예정량({incoming_val:,}개) 반영 시 다음 발주 데드라인({deadline_str})까지 **{d_day_sim}일의 여유**가 있습니다."
+            f"✅ **[안정]** 예정된 입고 스케줄 덕분에 다음 발주 데드라인({deadline_str})까지 **{d_day_num}일의 여유**가 있습니다."
         )
-    else:
-      st.info(
-          "💡 일평균 출고량이 0개로 설정되어 있어 재고가 소진되지 않습니다. 출고량을 입력해 보세요."
-      )
 
-    # 계단식 그래프 출력
+    # 계단식 그래프
     st.markdown(
-        f"#### 📈 [{target_sku}] 향후 60일간 본창고 vs VF 재고 변화 예측"
+        f"#### 📈 [{selected_target}] 향후 60일 재고 시뮬레이션 (입고 자동 충전 반영)"
     )
     fig = go.Figure()
     fig.add_trace(
@@ -528,7 +452,7 @@ if uploaded_file:
             x=sim_dates[:60],
             y=hist_main[:60],
             mode="lines+markers",
-            name="본창고 재고 (쿠팡 PO 시 계단식 차감)",
+            name="평택본창고 (쿠팡 PO 시 계단식 차감 & 입고일 충전)",
             line=dict(color="#1f77b4", width=3),
         )
     )
@@ -537,39 +461,48 @@ if uploaded_file:
             x=sim_dates[:60],
             y=hist_vf[:60],
             mode="lines",
-            name="VF 잔여 재고 (일일 출고로 감소)",
+            name="VF 잔여 재고 (일일 고객출고)",
             line=dict(color="#ff7f0e", width=2, dash="dash"),
         )
     )
+
+    if is_safety_mode:
+      fig.add_hline(
+          y=sim_safety_input,
+          line_dash="dashdot",
+          line_color="#ffbb00",
+          annotation_text=f"안전재고 마지노선 ({sim_safety_input:,}개)",
+      )
+
     fig.add_hline(
-        y=vf_trigger,
+        y=sim_vf_trig,
         line_dash="dot",
         line_color="red",
-        annotation_text=f"쿠팡 발주 트리거 ({vf_trigger}개)",
+        annotation_text=f"쿠팡 발주 트리거 ({sim_vf_trig}개)",
     )
 
     fig.update_layout(
         xaxis_title="날짜",
-        yaxis_title="재고 수량 (개)",
+        yaxis_title="수량 (개)",
         hovermode="x unified",
         margin=dict(l=20, r=20, t=30, b=20),
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("📅 일자별 쿠팡 PO 발생 및 본창고 이동/입고 타임라인"):
-      if po_log:
-        log_df = pd.DataFrame(
-            po_log,
-            columns=[
-                "예상일자",
-                "이벤트 내용",
-                "본창고 잔여",
-                "VF 잔여",
-            ],
+    # 타임라인 로그
+    with st.expander("📅 일자별 상세 쿠팡 PO 차감 및 본창고 입고 타임라인"):
+      if po_logs:
+        st.dataframe(
+            pd.DataFrame(
+                po_logs,
+                columns=["일자", "내용", "평택 잔여", "VF 잔여"],
+            ),
+            use_container_width=True,
         )
-        st.dataframe(log_df, use_container_width=True)
+      else:
+        st.info("시뮬레이션 기간 동안 발생한 이벤트가 없습니다.")
 
   except Exception as e:
-    st.error(f"오류가 발생했습니다: {e}")
+    st.error(f"엑셀 데이터를 읽는 중 오류가 발생했습니다: {e}")
 else:
-  st.info("👈 왼쪽 사이드바에서 엑셀 파일을 업로드해 주세요.")
+  st.info("👈 왼쪽 사이드바에서 수정하신 통합 마스터 엑셀 파일을 업로드해 주세요.")
