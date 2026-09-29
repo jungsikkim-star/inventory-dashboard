@@ -7,7 +7,7 @@ import re
 
 st.set_page_config(layout="wide", page_title="쿠팡 VF & 평택(본창고) 마스터 발주 대시보드")
 st.title("📦 쿠팡 VF & 평택물류 통합 마스터 발주 시스템")
-st.caption("SKU별 개별 리드타임/트리거 반영 + 계단식 PO 차감 + 오늘 기준 자동 갱신 발주 시스템")
+st.caption("다중 월 시트(9월+10월...) 자동 연동 + 실시간 계단식 PO 차감 + 공장 리드타임 역산 엔진")
 
 # 1. 사이드바 설정
 st.sidebar.header("📁 엑셀 파일 업로드")
@@ -16,7 +16,6 @@ uploaded_file = st.sidebar.file_uploader("통합 마스터 엑셀 업로드 (.xl
 st.sidebar.divider()
 st.sidebar.header("⚙️ 발주 및 시뮬레이션 기본값")
 
-# ⭐ 오늘 날짜 자동 반영
 today_now = datetime.today().date()
 base_date_input = st.sidebar.date_input("재고/출고 기준일자 (기본: 오늘)", today_now)
 
@@ -27,20 +26,8 @@ recent_days_window = st.sidebar.number_input(
     value=7, 
     help="기준일자 직전 며칠간의 일일 출고량을 평균 낼지 설정합니다. (기본: 최근 7일)"
 )
-default_lead_time = st.sidebar.number_input(
-    "기본 생산/입고 리드타임 (일)", 
-    min_value=1, 
-    max_value=120, 
-    value=35,
-    help="엑셀에 개별 리드타임이 미작성된 품목에 공통 적용될 기본 일수입니다."
-)
-default_vf_trigger = st.sidebar.number_input(
-    "기본 쿠팡 PO 트리거 (VF 잔여)", 
-    min_value=0, 
-    value=200, 
-    step=10, 
-    help="엑셀에 개별 트리거가 미작성된 품목에 공통 적용될 기준 수량입니다."
-)
+default_lead_time = st.sidebar.number_input("기본 생산/입고 리드타임 (일)", min_value=1, max_value=120, value=35)
+default_vf_trigger = st.sidebar.number_input("기본 쿠팡 PO 트리거 (VF 잔여)", min_value=0, value=200, step=10)
 
 def clean_txt(val):
     if pd.isna(val):
@@ -55,170 +42,245 @@ def clean_num(val):
     except:
         return 0.0
 
+# 단일 시트 파싱 함수
+def parse_single_sheet(uploaded_file, s_name, base_year):
+    raw_df = pd.read_excel(uploaded_file, sheet_name=s_name, header=None)
+    sku_row_idx = None
+    date_row_idx = None
+
+    for r in range(min(6, len(raw_df))):
+        row_vals = [clean_txt(x) for x in raw_df.iloc[r].values]
+        row_str = " ".join(row_vals)
+        if "품명" in row_str and sku_row_idx is None:
+            sku_row_idx = r
+        if any(re.search(r"^\d{4}$|^\d{3}$", v) for v in row_vals) and date_row_idx is None:
+            date_row_idx = r
+
+    if sku_row_idx is None:
+        sku_row_idx = 1
+    if date_row_idx is None:
+        date_row_idx = sku_row_idx + 1
+
+    data_start_row = max(sku_row_idx, date_row_idx) + 1
+
+    col_headers = []
+    for c in range(raw_df.shape[1]):
+        pieces = []
+        for r in range(data_start_row):
+            val = clean_txt(raw_df.iloc[r, c])
+            if val and val not in pieces:
+                pieces.append(val)
+        col_headers.append("_".join(pieces))
+
+    sku_col_idx = None
+    category_col_idx = None
+    moq_col_idx = None
+    vf_col_idx = None
+    main_col_idx = None
+    safety_col_idx = None
+    lead_time_col_idx = None
+    trigger_col_idx = None
+
+    date_col_map = {}
+    inbound_col_info = []
+
+    for idx, h in enumerate(col_headers):
+        h_upper = h.upper()
+        if "품명" in h and sku_col_idx is None:
+            sku_col_idx = idx
+        elif ("구분" in h or "유형" in h) and category_col_idx is None:
+            category_col_idx = idx
+        elif ("MOQ" in h_upper or "납품" in h) and moq_col_idx is None:
+            moq_col_idx = idx
+        elif "안전재고" in h and safety_col_idx is None:
+            safety_col_idx = idx
+        elif ("VF" in h_upper and ("재고" in h or "수량" in h)) and vf_col_idx is None:
+            vf_col_idx = idx
+        elif (("평택" in h or "본창고" in h or "본물류" in h) and "재고" in h and "안전" not in h) and main_col_idx is None:
+            main_col_idx = idx
+        elif any(k in h for k in ["리드타임", "생산일수", "조달기간"]) or "L/T" in h_upper or "LT" in h_upper:
+            if lead_time_col_idx is None:
+                lead_time_col_idx = idx
+        elif any(k in h for k in ["트리거", "발주점", "PO트리거", "PO발생"]) and trigger_col_idx is None:
+            trigger_col_idx = idx
+
+        match_date = re.search(r"(\d{2})(\d{2})", h)
+        if match_date and ("입고" not in h) and ("재고" not in h):
+            m_int = int(match_date.group(1))
+            d_int = int(match_date.group(2))
+            if 1 <= m_int <= 12 and 1 <= d_int <= 31:
+                try:
+                    col_dt = datetime(base_year, m_int, d_int).date()
+                    date_col_map[col_dt] = idx
+                except:
+                    pass
+
+        if "입고" in h:
+            m_match = re.search(r"(\d{1,2})월\s*(\d{1,2})일", h)
+            if m_match:
+                inbound_col_info.append((idx, int(m_match.group(1)), int(m_match.group(2))))
+
+    if sku_col_idx is None:
+        sku_col_idx = 1
+
+    df_rows = raw_df.iloc[data_start_row:].copy()
+    valid_indices = []
+    for r_i, r_val in df_rows.iterrows():
+        name = str(r_val[sku_col_idx]).strip()
+        if pd.isna(r_val[sku_col_idx]) or name in ["", "nan", "NaN", "합계", "평균", "비고"]:
+            continue
+        if "합계" in name:
+            continue
+        valid_indices.append(r_i)
+
+    df_rows = df_rows.loc[valid_indices]
+    return df_rows, sku_col_idx, category_col_idx, moq_col_idx, vf_col_idx, main_col_idx, safety_col_idx, lead_time_col_idx, trigger_col_idx, date_col_map, inbound_col_info
+
 if uploaded_file:
     try:
         xl = pd.ExcelFile(uploaded_file)
-        sheet_name = st.sidebar.selectbox("조회할 시트 선택:", xl.sheet_names, index=0)
-        raw_df = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
+        sheet_names = xl.sheet_names
 
-        sku_row_idx = None
-        date_row_idx = None
-
-        for r in range(min(6, len(raw_df))):
-            row_vals = [clean_txt(x) for x in raw_df.iloc[r].values]
-            row_str = " ".join(row_vals)
-            if "품명" in row_str and sku_row_idx is None:
-                sku_row_idx = r
-            if any(re.search(r"^0901$|^901$|\b0901\b", v) for v in row_vals) and date_row_idx is None:
-                date_row_idx = r
-
-        if sku_row_idx is None:
-            sku_row_idx = 1
-        if date_row_idx is None:
-            date_row_idx = sku_row_idx + 1
-
-        data_start_row = max(sku_row_idx, date_row_idx) + 1
-
-        # 헤더 결합
-        col_headers = []
-        for c in range(raw_df.shape[1]):
-            pieces = []
-            for r in range(data_start_row):
-                val = clean_txt(raw_df.iloc[r, c])
-                if val and val not in pieces:
-                    pieces.append(val)
-            col_headers.append("_".join(pieces))
-
-        sku_col_idx = None
-        category_col_idx = None
-        moq_col_idx = None
-        vf_col_idx = None
-        main_col_idx = None
-        safety_col_idx = None
-        lead_time_col_idx = None
-        trigger_col_idx = None
-
-        date_col_map = {}
-        inbound_col_info = []
+        # 다중 시트 분석 옵션
+        st.sidebar.divider()
+        mode_option = st.sidebar.radio(
+            "📊 시트 연동 모드:",
+            ["✨ 전체 월 시트 자동 통합 (추천: 9월+10월 연속 연동)", "📑 특정 시트 1개만 개별 조회"],
+            index=0
+        )
 
         base_year = base_date_input.year
 
-        for idx, h in enumerate(col_headers):
-            h_upper = h.upper()
+        if "전체 월 시트 자동 통합" in mode_option and len(sheet_names) > 1:
+            st.info(f"🔗 **{len(sheet_names)}개 시트 자동 연동 중:** {', '.join(sheet_names)}의 출고 데이터를 하나로 연결합니다.")
+            
+            # 모든 시트의 출고 날짜를 통합하는 사전 {품명: {날짜: 출고량}}
+            sku_date_sales = {}
+            sku_latest_info = {}
 
-            if "품명" in h and sku_col_idx is None:
-                sku_col_idx = idx
-            elif ("구분" in h or "유형" in h) and category_col_idx is None:
-                category_col_idx = idx
-            elif ("MOQ" in h_upper or "납품" in h) and moq_col_idx is None:
-                moq_col_idx = idx
-            elif "안전재고" in h and safety_col_idx is None:
-                safety_col_idx = idx
-            elif ("VF" in h_upper and ("재고" in h or "수량" in h)) and vf_col_idx is None:
-                vf_col_idx = idx
-            elif (("평택" in h or "본창고" in h or "본물류" in h) and "재고" in h and "안전" not in h) and main_col_idx is None:
-                main_col_idx = idx
-            # ⭐ SKU별 개별 리드타임 컬럼 탐색
-            elif any(k in h for k in ["리드타임", "생산일수", "조달기간"]) or "L/T" in h_upper or "LT" in h_upper:
-                if lead_time_col_idx is None:
-                    lead_time_col_idx = idx
-            # ⭐ SKU별 개별 쿠팡 PO 트리거 컬럼 탐색
-            elif any(k in h for k in ["트리거", "발주점", "PO트리거", "PO발생"]) and trigger_col_idx is None:
-                trigger_col_idx = idx
+            # 시트들을 순회하며 데이터 적재 (마지막 시트 정보가 최신 재고/스케줄로 덮어씌워짐)
+            for s_name in sheet_names:
+                df_rows, sku_c, cat_c, moq_c, vf_c, main_c, safe_c, lt_c, trig_c, d_map, in_info = parse_single_sheet(uploaded_file, s_name, base_year)
 
-            # 일일 출고 컬럼 탐색
-            match_date = re.search(r"(\d{2})(\d{2})", h)
-            if match_date and ("입고" not in h) and ("재고" not in h):
-                m_int = int(match_date.group(1))
-                d_int = int(match_date.group(2))
-                if 1 <= m_int <= 12 and 1 <= d_int <= 31:
-                    try:
-                        col_dt = datetime(base_year, m_int, d_int).date()
-                        date_col_map[col_dt] = idx
-                    except:
-                        pass
+                for _, r in df_rows.iterrows():
+                    s_name_val = str(r[sku_c]).strip()
+                    if s_name_val not in sku_date_sales:
+                        sku_date_sales[s_name_val] = {}
 
-            # 우측 입고 스케줄 탐색
-            if "입고" in h:
-                m_match = re.search(r"(\d{1,2})월\s*(\d{1,2})일", h)
-                if m_match:
-                    inbound_col_info.append((idx, int(m_match.group(1)), int(m_match.group(2))))
+                    # 일일 출고 적재
+                    for dt_val, col_i in d_map.items():
+                        q_val = clean_num(r[col_i])
+                        if q_val > 0:
+                            sku_date_sales[s_name_val][dt_val] = q_val
 
-        if sku_col_idx is None:
-            sku_col_idx = 1
+                    # 최신 시트 메타데이터 갱신
+                    cat_val = str(r[cat_c]).strip() if cat_c is not None and pd.notna(r[cat_c]) else "기타"
+                    moq_val = clean_num(r[moq_c]) if moq_c is not None else 100.0
+                    vf_val = clean_num(r[vf_c]) if vf_c is not None else 0.0
+                    main_val = clean_num(r[main_c]) if main_c is not None else 0.0
+                    safe_val = clean_num(r[safe_c]) if safe_c is not None else 0.0
+                    lt_val = clean_num(r[lt_c]) if lt_c is not None else 0.0
+                    trig_val = clean_num(r[trig_c]) if trig_c is not None else 0.0
 
-        df_rows = raw_df.iloc[data_start_row:].copy()
-        valid_indices = []
-        for r_i, r_val in df_rows.iterrows():
-            name = str(r_val[sku_col_idx]).strip()
-            if pd.isna(r_val[sku_col_idx]) or name in ["", "nan", "NaN", "합계", "평균", "비고"]:
-                continue
-            if "합계" in name:
-                continue
-            valid_indices.append(r_i)
+                    inbounds = []
+                    for ic_idx, m, d in in_info:
+                        qty = clean_num(r[ic_idx])
+                        if qty > 0:
+                            y = base_year if m >= base_date_input.month else base_year + 1
+                            in_d = datetime(y, m, d).date()
+                            if in_d >= base_date_input:
+                                inbounds.append((in_d, int(qty)))
+                    inbounds.sort(key=lambda x: x[0])
 
-        df_rows = df_rows.loc[valid_indices]
+                    sku_latest_info[s_name_val] = {
+                        "구분": cat_val,
+                        "평택(본창고)": int(main_val),
+                        "VF재고": int(vf_val),
+                        "납품MOQ": int(moq_val) if moq_val > 0 else 100,
+                        "안전재고": int(safe_val),
+                        "개별리드타임": int(lt_val) if lt_val > 0 else int(default_lead_time),
+                        "개별트리거": int(trig_val) if trig_val > 0 else int(default_vf_trigger),
+                        "입고스케줄": inbounds
+                    }
 
-        # 기준일자 직전 N일 날짜 컬럼 추출
-        target_calc_dates = []
-        for d_back in range(1, int(recent_days_window) + 1):
-            check_d = base_date_input - timedelta(days=d_back)
-            if check_d in date_col_map:
-                target_calc_dates.append((check_d, date_col_map[check_d]))
+            # 통합 품목 리스트 구성
+            processed_items = []
+            calc_days = int(recent_days_window)
+            target_dates = [base_date_input - timedelta(days=d) for d in range(1, calc_days + 1)]
 
-        if not target_calc_dates and (base_date_input in date_col_map):
-            target_calc_dates.append((base_date_input, date_col_map[base_date_input]))
+            for s_name_val, meta in sku_latest_info.items():
+                sales_dict = sku_date_sales.get(s_name_val, {})
+                # 기준일자 직전 7일 출고량 합산
+                recent_sum = sum([sales_dict.get(t_d, 0.0) for t_d in target_dates])
+                adu = recent_sum / float(calc_days)
 
-        period_desc = f"{target_calc_dates[-1][0].strftime('%m/%d')} ~ {target_calc_dates[0][0].strftime('%m/%d')} ({len(target_calc_dates)}일간)" if target_calc_dates else "날짜 컬럼 불일치 (전체 확인 필요)"
+                item_entry = {"품명": s_name_val, "일출고량": adu}
+                item_entry.update(meta)
+                processed_items.append(item_entry)
 
-        # 데이터 변환
-        processed_items = []
-        for _, r in df_rows.iterrows():
-            item_name = str(r[sku_col_idx]).strip()
-            item_cat = str(r[category_col_idx]).strip() if category_col_idx is not None and pd.notna(r[category_col_idx]) else "기타"
-            item_moq = clean_num(r[moq_col_idx]) if moq_col_idx is not None else 100.0
-            item_vf = clean_num(r[vf_col_idx]) if vf_col_idx is not None else 0.0
-            item_main = clean_num(r[main_col_idx]) if main_col_idx is not None else 0.0
-            item_safety = clean_num(r[safety_col_idx]) if safety_col_idx is not None else 0.0
+            df_items = pd.DataFrame(processed_items)
+            period_desc = f"{target_dates[-1].strftime('%m/%d')} ~ {target_dates[0].strftime('%m/%d')} (다중 시트 연속 {calc_days}일 평균)"
 
-            # SKU별 개별 리드타임 & 트리거 파싱 (없거나 0이면 기본값 사용)
-            item_lt_val = clean_num(r[lead_time_col_idx]) if lead_time_col_idx is not None else 0.0
-            applied_lt = int(item_lt_val) if item_lt_val > 0 else int(default_lead_time)
+        else:
+            # 단일 시트 모드
+            selected_sheet = st.sidebar.selectbox("조회할 시트 선택:", sheet_names, index=0)
+            df_rows, sku_c, cat_c, moq_c, vf_c, main_c, safe_c, lt_c, trig_c, d_map, in_info = parse_single_sheet(uploaded_file, selected_sheet, base_year)
 
-            item_trig_val = clean_num(r[trigger_col_idx]) if trigger_col_idx is not None else 0.0
-            applied_trig = int(item_trig_val) if item_trig_val > 0 else int(default_vf_trigger)
+            target_calc_dates = []
+            for d_back in range(1, int(recent_days_window) + 1):
+                check_d = base_date_input - timedelta(days=d_back)
+                if check_d in d_map:
+                    target_calc_dates.append((check_d, d_map[check_d]))
 
-            if target_calc_dates:
-                sum_recent_sales = sum([clean_num(r[c_idx]) for _, c_idx in target_calc_dates])
-                adu = sum_recent_sales / float(len(target_calc_dates))
-            else:
-                adu = 0.0
+            if not target_calc_dates and (base_date_input in d_map):
+                target_calc_dates.append((base_date_input, d_map[base_date_input]))
 
-            inbounds = []
-            for ic_idx, m, d in inbound_col_info:
-                qty = clean_num(r[ic_idx])
-                if qty > 0:
-                    y = base_year if m >= base_date_input.month else base_year + 1
-                    in_d = datetime(y, m, d).date()
-                    if in_d >= base_date_input:
-                        inbounds.append((in_d, int(qty)))
+            period_desc = f"{target_calc_dates[-1][0].strftime('%m/%d')} ~ {target_calc_dates[0][0].strftime('%m/%d')} ({len(target_calc_dates)}일간)" if target_calc_dates else "날짜 컬럼 불일치"
 
-            inbounds.sort(key=lambda x: x[0])
+            processed_items = []
+            for _, r in df_rows.iterrows():
+                item_name = str(r[sku_c]).strip()
+                item_cat = str(r[cat_c]).strip() if cat_c is not None and pd.notna(r[cat_c]) else "기타"
+                item_moq = clean_num(r[moq_c]) if moq_c is not None else 100.0
+                item_vf = clean_num(r[vf_c]) if vf_c is not None else 0.0
+                item_main = clean_num(r[main_c]) if main_c is not None else 0.0
+                item_safety = clean_num(r[safe_c]) if safe_c is not None else 0.0
+                item_lt = clean_num(r[lt_c]) if lt_c is not None else 0.0
+                item_trig = clean_num(r[trig_c]) if trig_c is not None else 0.0
 
-            processed_items.append({
-                "구분": item_cat,
-                "품명": item_name,
-                "평택(본창고)": int(item_main),
-                "VF재고": int(item_vf),
-                "납품MOQ": int(item_moq) if item_moq > 0 else 100,
-                "안전재고": int(item_safety),
-                "개별리드타임": applied_lt,
-                "개별트리거": applied_trig,
-                "일출고량": adu,
-                "입고스케줄": inbounds
-            })
+                applied_lt = int(item_lt) if item_lt > 0 else int(default_lead_time)
+                applied_trig = int(item_trig) if item_trig > 0 else int(default_vf_trigger)
 
-        df_items = pd.DataFrame(processed_items)
+                if target_calc_dates:
+                    sum_sales = sum([clean_num(r[c_idx]) for _, c_idx in target_calc_dates])
+                    adu = sum_sales / float(len(target_calc_dates))
+                else:
+                    adu = 0.0
+
+                inbounds = []
+                for ic_idx, m, d in in_info:
+                    qty = clean_num(r[ic_idx])
+                    if qty > 0:
+                        y = base_year if m >= base_date_input.month else base_year + 1
+                        in_d = datetime(y, m, d).date()
+                        if in_d >= base_date_input:
+                            inbounds.append((in_d, int(qty)))
+                inbounds.sort(key=lambda x: x[0])
+
+                processed_items.append({
+                    "구분": item_cat,
+                    "품명": item_name,
+                    "평택(본창고)": int(item_main),
+                    "VF재고": int(item_vf),
+                    "납품MOQ": int(item_moq) if item_moq > 0 else 100,
+                    "안전재고": int(item_safety),
+                    "개별리드타임": applied_lt,
+                    "개별트리거": applied_trig,
+                    "일출고량": adu,
+                    "입고스케줄": inbounds
+                })
+
+            df_items = pd.DataFrame(processed_items)
 
         # 2. 카테고리 필터
         st.divider()
@@ -228,10 +290,9 @@ if uploaded_file:
 
         view_items = df_items if selected_cat == "전체 보기" else df_items[df_items["구분"] == selected_cat]
 
-        # 3. 전 품목 시뮬레이션 연산 (SKU별 개별 리드타임/트리거 자동 적용)
+        # 3. 전 품목 시뮬레이션 연산
         sim_days = 90
         sim_dates = [base_date_input + timedelta(days=i) for i in range(sim_days)]
-
         master_table_rows = []
 
         for _, item in view_items.iterrows():
@@ -260,7 +321,6 @@ if uploaded_file:
                 if adu > 0:
                     c_vf -= adu
 
-                # 개별 트리거 기준 쿠팡 PO 발생 체크
                 if adu > 0 and c_vf < trig:
                     if first_po_day is None:
                         first_po_day = curr_d
@@ -292,7 +352,6 @@ if uploaded_file:
             else:
                 b_date = sim_dates[main_breach_day]
                 breach_txt = f"{b_date.strftime('%m/%d')} (D+{main_breach_day}일)"
-                # ⭐ 품목별 개별 리드타임(lt)을 역산하여 데드라인 도출
                 order_deadline = b_date - timedelta(days=lt)
                 deadline_txt = order_deadline.strftime('%Y-%m-%d')
                 d_day_val = (order_deadline - base_date_input).days
@@ -325,16 +384,14 @@ if uploaded_file:
             })
 
         summary_df = pd.DataFrame(master_table_rows)
-
         sorted_table = summary_df.drop(columns=["raw_name", "d_day_num"]).sort_values(by="발주상태").reset_index(drop=True)
         sorted_table.index = sorted_table.index + 1
 
-        # KPI
         u_cnt = len(summary_df[summary_df["발주상태"].str.contains("초긴급")])
         w_cnt = len(summary_df[summary_df["발주상태"].str.contains("긴급|준비")])
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("📅 기준일자 (오늘)", base_date_input.strftime("%Y-%m-%d"))
+        k1.metric("📅 기준일자", base_date_input.strftime("%Y-%m-%d"))
         k2.metric("📊 출고 평균 산출 구간", period_desc)
         k3.metric("🚨 즉시 공장 발주 필요", f"{u_cnt} 개 SKU", delta_color="inverse")
         k4.metric("⚠️ 14일 내 발주 예정", f"{w_cnt} 개 SKU")
@@ -342,7 +399,7 @@ if uploaded_file:
         st.subheader("📋 전체 품목 쿠팡 PO 연동 및 평택창고 발주 데드라인 마스터 테이블")
         st.dataframe(sorted_table, use_container_width=True)
 
-        # 4. 하단 개별 정밀 시뮬레이터 & 그래프
+        # 4. 하단 개별 SKU 시뮬레이터
         st.divider()
         st.subheader("🔍 개별 SKU 쿠팡 PO 차감 타임라인 & 재고 곡선")
 
