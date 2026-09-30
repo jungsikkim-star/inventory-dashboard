@@ -235,8 +235,11 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
                 entered=sorted(entered), inbound_cols=inbound_cols, unparsed=unparsed, missing=missing)
 
 
+PARSER_VERSION = 3     # parse_sheet 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+
+
 @st.cache_data(show_spinner="엑셀 분석 중...")
-def load_workbook(file_bytes: bytes) -> list:
+def load_workbook(file_bytes: bytes, parser_version: int = PARSER_VERSION) -> list:
     import io
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     return [parse_sheet(xl.parse(s, header=None), s, today_kst().year) for s in xl.sheet_names]
@@ -536,7 +539,7 @@ def main():
     raw_bytes = up.getvalue()
     sig = hashlib.md5(raw_bytes).hexdigest()[:8]
     try:
-        sheets = load_workbook(raw_bytes)
+        sheets = load_workbook(raw_bytes, PARSER_VERSION)
     except Exception as e:
         st.error("엑셀을 읽는 중 오류가 발생했습니다.")
         st.exception(e)
@@ -591,7 +594,7 @@ def main():
                 n_items[col_] = n_items.get(col_, 0) + 1
         icols = latest_sheet["inbound_cols"]
         tbl = pd.DataFrame(
-            [{"품목군": c["group"], "원본 발주일": c["raw_order"] or "-", "원본 입고일": c["raw_arrival"],
+            [{"품목군": c["group"], "원본 발주일": c.get("raw_order") or "-", "원본 입고일": c.get("raw_arrival", ""),
               "수량 있는 품목": n_items.get(c["col"], 0), "발주일": c["order"], "입고일": c["arrival"]} for c in icols],
             index=[c["col"] for c in icols])
         with st.expander("🗓️ 입고 일정 보정 (발주일·입고일 직접 수정)", expanded=False):
