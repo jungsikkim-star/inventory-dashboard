@@ -189,7 +189,8 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
         if arrival is None:
             unparsed.append(f"{group} / {a_txt}")
             continue
-        inbound_cols.append(dict(col=c, group=group, order=order, arrival=arrival, est=bool(o_est or a_est), arr_est=a_est))
+        inbound_cols.append(dict(col=c, group=group, order=order, arrival=arrival, est=bool(o_est or a_est), arr_est=a_est,
+                                 raw_order=(o_m.group(1) if o_m else ""), raw_arrival=a_txt))
 
     # 품목 행
     rows, valid_idx = [], []
@@ -216,7 +217,7 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
         for ic in inbound_cols:
             q = to_num(raw.iat[r, ic["col"]])
             if q and q > 0:
-                inbound.append((ic["arrival"], q, ic["arr_est"], ic["group"], ic["order"]))
+                inbound.append((ic["arrival"], q, ic["arr_est"], ic["group"], ic["order"], ic["col"]))
         rows.append(dict(
             key=clean_txt(raw.iat[r, cols["name"]]),
             name=str(raw.iat[r, cols["name"]]).strip(),
@@ -239,6 +240,36 @@ def load_workbook(file_bytes: bytes) -> list:
     import io
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
     return [parse_sheet(xl.parse(s, header=None), s, today_kst().year) for s in xl.sheet_names]
+
+
+def as_date(v):
+    if v is None or (not isinstance(v, (date, datetime)) and pd.isna(v)):
+        return None
+    return v.date() if isinstance(v, datetime) else (v if isinstance(v, date) else None)
+
+
+def apply_inbound_overrides(sheets: list, sheet_name: str, overrides: dict) -> list:
+    """overrides = {컬럼번호: (발주일 또는 None, 입고일)}. 화면에서 직접 고친 날짜는 '확정'으로 취급한다."""
+    if not overrides:
+        return sheets
+    out = []
+    for sh in sheets:
+        if sh["name"] != sheet_name:
+            out.append(sh)
+            continue
+        cols = []
+        for c in sh["inbound_cols"]:
+            o = overrides.get(c["col"])
+            cols.append(dict(c, order=o[0], arrival=o[1], est=False, arr_est=False) if o else c)
+        rows = []
+        for r in sh["rows"]:
+            ib = []
+            for (arr, q, est, g, od, col) in r["inbound"]:
+                o = overrides.get(col)
+                ib.append((o[1], q, False, g, o[0], col) if o else (arr, q, est, g, od, col))
+            rows.append(dict(r, inbound=ib))
+        out.append(dict(sh, inbound_cols=cols, rows=rows))
+    return out
 
 
 # ─────────────────────────────── 품목 구성 ───────────────────────────────
@@ -297,7 +328,7 @@ def build_items(sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_keywo
         for r in sh["rows"]:
             a = acc.setdefault(r["key"], dict(sales={}, groups=set()))
             a["sales"].update(r["sales"])
-            a["groups"] |= {g for (_, _, _, g, _) in r["inbound"]}
+            a["groups"] |= {g for (_, _, _, g, _, _) in r["inbound"]}
             a["row"], a["sheet"] = r, sh["name"]
     items = []
     for a in acc.values():
@@ -315,10 +346,10 @@ def build_items(sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_keywo
         moq_missing = not r["moq_all"] and not (r["moq"] and r["moq"] > 0)
         plan = {d: q for d, q in a["sales"].items() if d >= base and q > 0} if use_plan else {}
         detail = []
-        for (d_arr, q_in, est_in, grp, d_ord) in r["inbound"]:
+        for (d_arr, q_in, est_in, grp, d_ord, _col) in r["inbound"]:
             if d_arr < base:
                 continue                                    # 이미 입고된 건은 현재 재고에 포함돼 있음
-            ordered = d_ord is None or d_ord < base         # 발주일이 기준일 '이전'일 때만 발주 완료 (발주일 미기재는 완료로 간주)
+            ordered = d_ord is None or d_ord <= base        # 발주일이 기준일 이전이거나 당일이면 발주 완료 (미기재는 완료로 간주)
             detail.append(dict(arrival=d_arr, qty=q_in, est=est_in, group=grp, order=d_ord, ordered=ordered))
         detail.sort(key=lambda x: (x["arrival"], x["order"] or date.min))
         items.append(Item(
@@ -550,6 +581,34 @@ def main():
                                    help="기준일 이후 날짜 칸에 이미 수량이 적혀 있으면 그 기간은 평균 대신 그 값을 그대로 출고로 사용합니다.")
     include_stale = st.sidebar.checkbox("최신 월 시트에 없는 품목도 포함", False)
 
+    # ── 입고 일정 보정: '11월초' 같은 추정 표기를 실제 날짜로 직접 고칠 수 있음 (최신 월 시트 기준)
+    latest_sheet = sorted(sheets, key=lambda s_: (s_["year"], s_["month"]))[-1]
+    overrides = {}
+    if latest_sheet["inbound_cols"]:
+        n_items = {}
+        for r_ in latest_sheet["rows"]:
+            for (*_, col_) in r_["inbound"]:
+                n_items[col_] = n_items.get(col_, 0) + 1
+        icols = latest_sheet["inbound_cols"]
+        tbl = pd.DataFrame(
+            [{"품목군": c["group"], "원본 발주일": c["raw_order"] or "-", "원본 입고일": c["raw_arrival"],
+              "수량 있는 품목": n_items.get(c["col"], 0), "발주일": c["order"], "입고일": c["arrival"]} for c in icols],
+            index=[c["col"] for c in icols])
+        with st.expander("🗓️ 입고 일정 보정 (발주일·입고일 직접 수정)", expanded=False):
+            st.caption("엑셀에 '11월초' 처럼 대략 적힌 날짜를 실제 날짜로 바꾸면 그 날짜가 확정으로 계산에 쓰입니다. "
+                       "발주일이 기준일 당일 또는 이전이면 발주 완료로 반영됩니다. 새 파일을 올리면 보정은 초기화되니, 계속 쓰려면 엑셀 헤더에 날짜를 적어 두세요.")
+            edited = st.data_editor(
+                tbl, hide_index=True, key=f"inb_edit_{sig}",
+                disabled=["품목군", "원본 발주일", "원본 입고일", "수량 있는 품목"],
+                column_config={"발주일": st.column_config.DateColumn("발주일", format="YYYY-MM-DD"),
+                               "입고일": st.column_config.DateColumn("입고일", format="YYYY-MM-DD")})
+        for col_idx, row_ in edited.iterrows():
+            o_new, a_new = as_date(row_["발주일"]), as_date(row_["입고일"])
+            orig = next(c for c in icols if c["col"] == col_idx)
+            if a_new is not None and (o_new, a_new) != (orig["order"], orig["arrival"]):
+                overrides[col_idx] = (o_new, a_new)
+    sheets = apply_inbound_overrides(sheets, latest_sheet["name"], overrides)
+
     items, latest, entered, lt_est = build_items(
         sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_kw, include_stale, use_plan)
     if not items:
@@ -603,10 +662,12 @@ def main():
     k4.metric("⚠️ 14일 내 발주", f"{int(view['_tier'].isin([2, 3]).sum())} 개 SKU")
 
     notes = []
+    if overrides:
+        notes.append(f"입고 일정 {len(overrides)}개 컬럼을 화면에서 직접 보정했습니다 (보정한 날짜는 확정으로 계산).")
     not_yet = [(it, x) for it in items for x in it.inbound_detail if not x["ordered"]]
     if not_yet:
         cols_ = {(x["group"], x["order"], x["arrival"]) for _, x in not_yet}
-        notes.append(f"발주일이 기준일({base:%m/%d}) 이후(또는 당일)인 입고 계획 {len(cols_)}개 컬럼(품목 {len({it.name for it, _ in not_yet})}개)은 "
+        notes.append(f"발주일이 기준일({base:%m/%d})보다 뒤인 입고 계획 {len(cols_)}개 컬럼(품목 {len({it.name for it, _ in not_yet})}개)은 "
                      "아직 발주 전으로 보고 재고 계산에서 제외했습니다. 표의 '입고계획(미발주)'에 합계만 참고용으로 표시합니다.")
     if any(x["order"] is None and x["arrival"] >= base for it in items for x in it.inbound_detail):
         notes.append("발주일이 적혀 있지 않은 입고 컬럼은 발주 완료로 간주했습니다.")
@@ -722,7 +783,7 @@ def main():
         else:
             st.write("기간 내 이벤트가 없습니다.")
         if it.inbound_detail:
-            st.write("**공장 입고 스케줄** (발주일이 기준일 이전이면 발주완료로 반영)")
+            st.write("**공장 입고 스케줄** (발주일이 기준일 당일 또는 이전이면 발주완료로 반영)")
             st.dataframe(pd.DataFrame([{
                 "품목군": x["group"], "발주일": x["order"], "입고일": x["arrival"], "수량": int(x["qty"]),
                 "날짜": "추정" if x["est"] else "확정",
