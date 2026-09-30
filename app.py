@@ -1,484 +1,692 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-from datetime import datetime, timedelta
+"""
+쿠팡 VF & 평택(본창고) 통합 마스터 발주 대시보드  (v2)
+
+업로드 엑셀(월별 시트: '9월', '10월' ...) 구조를 전제로 합니다.
+  - 상단 헤더 3행: [구분/품명/일자] [요일] [합계, MMDD 날짜]
+  - 일자별 출고 → 납품 MOQ → VF재고 → 평택재고 → 평택 안전재고(45일분) → 발주필요
+  - 그 오른쪽: '발주일 : ○월○일 / 입고일 : ○월○일' 형태의 공장 입고 스케줄 컬럼들
+
+핵심 가정 (사이드바에서 조정 가능)
+  - 구분이 '밀크런'인 품목은 VF재고가 없고, 일자별 출고 = 평택에서 쿠팡으로 직접 나간 물량.
+  - 그 외(벤플/글로브 등)는 VF재고가 고객 출고로 줄고, VF가 트리거 밑으로 내려가면
+    쿠팡 PO가 발생해 평택 재고가 MOQ × 배수만큼 VF로 이동.
+  - 공장 발주 데드라인 = (안전재고 도달일 또는 평택 결품일) - 리드타임.
+"""
+import calendar
+import hashlib
+import math
 import re
+import statistics
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 
-st.set_page_config(layout="wide", page_title="쿠팡 VF & 평택(본창고) 마스터 발주 대시보드")
-st.title("📦 쿠팡 VF & 평택물류 통합 마스터 발주 시스템")
-st.caption("다중 월 시트(9월+10월...) 자동 연동 + 실시간 계단식 PO 차감 + 공장 리드타임 역산 엔진")
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-# 1. 사이드바 설정
-st.sidebar.header("📁 엑셀 파일 업로드")
-uploaded_file = st.sidebar.file_uploader("통합 마스터 엑셀 업로드 (.xlsx)", type=["xlsx"])
+KST = timezone(timedelta(hours=9))
+HORIZON = 180          # 시뮬레이션 기간(일). 리드타임(최대 120일) 이후까지 볼 수 있어야 함
+CHART_DAYS = 90
+DEFAULT_MOQ = 100      # MOQ 미기재 시 임시값
+PERIOD_DAY = {"초": 10, "중": 20, "말": None}   # '11월초/12월 중순/9월말' → 보수적으로 순의 끝날, 말=말일
 
-st.sidebar.divider()
-st.sidebar.header("⚙️ 발주 및 시뮬레이션 기본값")
 
-today_now = datetime.today().date()
-base_date_input = st.sidebar.date_input("재고/출고 기준일자 (기본: 오늘)", today_now)
+# ─────────────────────────────── 공통 유틸 ───────────────────────────────
+def today_kst() -> date:
+    return datetime.now(KST).date()
 
-recent_days_window = st.sidebar.number_input(
-    "출고 평균 산출 기간 (일)", 
-    min_value=1, 
-    max_value=31, 
-    value=7, 
-    help="기준일자 직전 며칠간의 일일 출고량을 평균 낼지 설정합니다. (기본: 최근 7일)"
-)
-default_lead_time = st.sidebar.number_input("기본 생산/입고 리드타임 (일)", min_value=1, max_value=120, value=35)
-default_vf_trigger = st.sidebar.number_input("기본 쿠팡 PO 트리거 (VF 잔여)", min_value=0, value=200, step=10)
 
-def clean_txt(val):
-    if pd.isna(val):
+def clean_txt(v) -> str:
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
         return ""
-    return str(val).strip().replace("\n", "").replace(" ", "")
+    return re.sub(r"\s+", "", str(v))
 
-def clean_num(val):
-    if pd.isna(val) or str(val).strip() in ["-", "", "#DIV/0!", "전량", "nan", "NaN", "O", "X"]:
-        return 0.0
+
+def to_num(v):
+    """숫자면 float, 빈칸/문자(전량, O, X 등)면 None."""
+    if v is None or (not isinstance(v, str) and pd.isna(v)):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
     try:
-        return float(str(val).replace(",", "").strip())
-    except:
-        return 0.0
+        return float(str(v).replace(",", "").strip())
+    except ValueError:
+        return None
 
-# 단일 시트 파싱 함수
-def parse_single_sheet(uploaded_file, s_name, base_year):
-    raw_df = pd.read_excel(uploaded_file, sheet_name=s_name, header=None)
-    sku_row_idx = None
-    date_row_idx = None
 
-    for r in range(min(6, len(raw_df))):
-        row_vals = [clean_txt(x) for x in raw_df.iloc[r].values]
-        row_str = " ".join(row_vals)
-        if "품명" in row_str and sku_row_idx is None:
-            sku_row_idx = r
-        if any(re.search(r"^\d{4}$|^\d{3}$", v) for v in row_vals) and date_row_idx is None:
-            date_row_idx = r
+def md_of(text: str):
+    """'0901' / '901' → (9, 1). 날짜처럼 안 보이면 None."""
+    if not text.isdigit() or not 3 <= len(text) <= 4:
+        return None
+    s = text.zfill(4)
+    mo, dy = int(s[:2]), int(s[2:])
+    return (mo, dy) if 1 <= mo <= 12 and 1 <= dy <= 31 else None
 
-    if sku_row_idx is None:
-        sku_row_idx = 1
-    if date_row_idx is None:
-        date_row_idx = sku_row_idx + 1
 
-    data_start_row = max(sku_row_idx, date_row_idx) + 1
+_MD = re.compile(r"(\d{1,2})월(\d{1,2})일")
+_SL = re.compile(r"(\d{1,2})[/.](\d{1,2})")
+_MP = re.compile(r"(\d{1,2})월(초순|초|중순|중|하순|말)")
 
-    col_headers = []
-    for c in range(raw_df.shape[1]):
+
+def parse_kr_date(text: str, anchor: date, not_before: date = None):
+    """'9월4일' '10월 10일' '11월초' '12월 중순' '9월말' → (date, 추정여부). 연도는 anchor 근처로 추정."""
+    t = clean_txt(text)
+    est, dy = False, None
+    m = _MD.search(t) or _SL.search(t)
+    if m:
+        mo, dy = int(m.group(1)), int(m.group(2))
+    else:
+        m = _MP.search(t)
+        if not m:
+            return None, False
+        mo, kw, est = int(m.group(1)), m.group(2), True
+        key = "초" if kw.startswith("초") else "중" if kw.startswith("중") else "말"
+        dy = PERIOD_DAY[key]
+    if not 1 <= mo <= 12:
+        return None, False
+    cands = []
+    for y in (anchor.year - 1, anchor.year, anchor.year + 1):
+        last = calendar.monthrange(y, mo)[1]
+        cands.append(date(y, mo, min(dy or last, last)))
+    if not_before:
+        later = [d for d in cands if d >= not_before]
+        return (min(later) if later else max(cands)), est
+    return min(cands, key=lambda d: abs((d - anchor).days)), est
+
+
+# ─────────────────────────────── 엑셀 파싱 ───────────────────────────────
+def match_columns(headers):
+    idx = {}
+    for i, h in enumerate(headers):
+        H = h.upper()
+        if "품명" in h:
+            idx.setdefault("name", i)
+        elif "구분" in h or "유형" in h:
+            idx.setdefault("cat", i)
+        elif "MOQ" in H or "납품" in h:
+            idx.setdefault("moq", i)
+        elif "안전재고" in h:
+            idx.setdefault("safety", i)
+        elif "VF" in H and ("재고" in h or "수량" in h):
+            idx.setdefault("vf", i)
+        elif ("평택" in h or "본창고" in h or "본물류" in h) and "재고" in h:
+            idx.setdefault("main", i)
+    return idx
+
+
+def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
+    n_rows, n_cols = raw.shape
+    sku_row, best = None, (0, None)
+    for r in range(min(8, n_rows)):
+        vals = [clean_txt(x) for x in raw.iloc[r].tolist()]
+        if sku_row is None and "품명" in vals:
+            sku_row = r
+        cnt = sum(1 for v in vals if md_of(v))
+        if cnt > best[0]:
+            best = (cnt, r)
+    date_row = best[1] if best[0] >= 5 else None
+    data_start = max(1 if sku_row is None else sku_row, 2 if date_row is None else date_row) + 1
+
+    # 시트 제목('26년 9월')에서 연/월
+    title = " ".join(clean_txt(raw.iat[r, c]) for r in range(min(3, n_rows)) for c in range(min(4, n_cols)))
+    tm = re.search(r"(\d{2,4})년(\d{1,2})월", title)
+    if tm:
+        year = int(tm.group(1)) + (2000 if int(tm.group(1)) < 100 else 0)
+        month = int(tm.group(2))
+    else:
+        mm = re.search(r"(\d{1,2})월", sheet_name)
+        year, month = fallback_year, int(mm.group(1)) if mm else 0
+
+    headers = []
+    for c in range(n_cols):
         pieces = []
-        for r in range(data_start_row):
-            val = clean_txt(raw_df.iloc[r, c])
-            if val and val not in pieces:
-                pieces.append(val)
-        col_headers.append("_".join(pieces))
+        for r in range(data_start):
+            t = clean_txt(raw.iat[r, c])
+            if t and t not in pieces:
+                pieces.append(t)
+        headers.append("_".join(pieces))
+    cols = match_columns(headers)
+    if "name" not in cols:
+        raise ValueError(f"시트 '{sheet_name}'에서 '품명' 컬럼을 찾지 못했습니다.")
 
-    sku_col_idx = None
-    category_col_idx = None
-    moq_col_idx = None
-    vf_col_idx = None
-    main_col_idx = None
-    safety_col_idx = None
-    lead_time_col_idx = None
-    trigger_col_idx = None
+    # 기준일(헤더의 =TODAY() 캐시값)
+    snapshot = None
+    for key in ("vf", "main"):
+        if key in cols:
+            for r in range(data_start):
+                v = raw.iat[r, cols[key]]
+                if isinstance(v, date):
+                    snapshot = v.date() if isinstance(v, datetime) else v
+                    break
+        if snapshot:
+            break
 
-    date_col_map = {}
-    inbound_col_info = []
-
-    for idx, h in enumerate(col_headers):
-        h_upper = h.upper()
-        if "품명" in h and sku_col_idx is None:
-            sku_col_idx = idx
-        elif ("구분" in h or "유형" in h) and category_col_idx is None:
-            category_col_idx = idx
-        elif ("MOQ" in h_upper or "납품" in h) and moq_col_idx is None:
-            moq_col_idx = idx
-        elif "안전재고" in h and safety_col_idx is None:
-            safety_col_idx = idx
-        elif ("VF" in h_upper and ("재고" in h or "수량" in h)) and vf_col_idx is None:
-            vf_col_idx = idx
-        elif (("평택" in h or "본창고" in h or "본물류" in h) and "재고" in h and "안전" not in h) and main_col_idx is None:
-            main_col_idx = idx
-        elif any(k in h for k in ["리드타임", "생산일수", "조달기간"]) or "L/T" in h_upper or "LT" in h_upper:
-            if lead_time_col_idx is None:
-                lead_time_col_idx = idx
-        elif any(k in h for k in ["트리거", "발주점", "PO트리거", "PO발생"]) and trigger_col_idx is None:
-            trigger_col_idx = idx
-
-        match_date = re.search(r"(\d{2})(\d{2})", h)
-        if match_date and ("입고" not in h) and ("재고" not in h):
-            m_int = int(match_date.group(1))
-            d_int = int(match_date.group(2))
-            if 1 <= m_int <= 12 and 1 <= d_int <= 31:
+    # 일자 컬럼
+    date_cols = {}
+    if date_row is not None:
+        for c in range(n_cols):
+            md = md_of(clean_txt(raw.iat[date_row, c]))
+            if md:
                 try:
-                    col_dt = datetime(base_year, m_int, d_int).date()
-                    date_col_map[col_dt] = idx
-                except:
+                    date_cols[date(year, md[0], md[1])] = c
+                except ValueError:      # 예: 9월 31일
                     pass
 
-        if "입고" in h:
-            m_match = re.search(r"(\d{1,2})월\s*(\d{1,2})일", h)
-            if m_match:
-                inbound_col_info.append((idx, int(m_match.group(1)), int(m_match.group(2))))
-
-    if sku_col_idx is None:
-        sku_col_idx = 1
-
-    df_rows = raw_df.iloc[data_start_row:].copy()
-    valid_indices = []
-    for r_i, r_val in df_rows.iterrows():
-        name = str(r_val[sku_col_idx]).strip()
-        if pd.isna(r_val[sku_col_idx]) or name in ["", "nan", "NaN", "합계", "평균", "비고"]:
+    # 입고 스케줄 컬럼 ('발주일 : ○ / 입고일 : ○')
+    anchor = date(year, month or 1, 15)
+    inbound_cols, unparsed = [], []
+    for c in range(n_cols):
+        pieces = [raw.iat[r, c] for r in range(data_start)]
+        joined = "|".join(clean_txt(p) for p in pieces)
+        if "입고일" not in joined:
             continue
-        if "합계" in name:
+        a_txt = re.search(r"입고일[:：]?([^|]*)", joined).group(1)
+        o_m = re.search(r"발주일[:：]?([^|]*)", joined)
+        order, o_est = (parse_kr_date(o_m.group(1), anchor) if o_m else (None, False))
+        arrival, a_est = parse_kr_date(a_txt, anchor, not_before=order)
+        group = next((re.sub(r"\s+", " ", str(p)).strip() for p in pieces
+                      if clean_txt(p) and "발주일" not in clean_txt(p) and "입고일" not in clean_txt(p)), "미분류")
+        if arrival is None:
+            unparsed.append(f"{group} / {a_txt}")
             continue
-        valid_indices.append(r_i)
+        inbound_cols.append(dict(col=c, group=group, order=order, arrival=arrival, est=bool(o_est or a_est), arr_est=a_est))
 
-    df_rows = df_rows.loc[valid_indices]
-    return df_rows, sku_col_idx, category_col_idx, moq_col_idx, vf_col_idx, main_col_idx, safety_col_idx, lead_time_col_idx, trigger_col_idx, date_col_map, inbound_col_info
+    # 품목 행
+    rows, valid_idx = [], []
+    for r in range(data_start, n_rows):
+        nm = raw.iat[r, cols["name"]]
+        key = clean_txt(nm)
+        if not key or key.lower() == "nan" or "합계" in key or key in ("평균", "비고"):
+            continue
+        cat_raw = raw.iat[r, cols["cat"]] if "cat" in cols else None
+        if "합계" in clean_txt(cat_raw):
+            continue
+        valid_idx.append(r)
 
-if uploaded_file:
-    try:
-        xl = pd.ExcelFile(uploaded_file)
-        sheet_names = xl.sheet_names
+    entered = set()
+    for d, c in date_cols.items():
+        if any(pd.notna(raw.iat[r, c]) for r in valid_idx):
+            entered.add(d)          # 한 품목이라도 값이 있으면 '입력된 날'
 
-        # 다중 시트 분석 옵션
-        st.sidebar.divider()
-        mode_option = st.sidebar.radio(
-            "📊 시트 연동 모드:",
-            ["✨ 전체 월 시트 자동 통합 (추천: 9월+10월 연속 연동)", "📑 특정 시트 1개만 개별 조회"],
-            index=0
-        )
+    for r in valid_idx:
+        moq_raw = raw.iat[r, cols["moq"]] if "moq" in cols else None
+        vf = to_num(raw.iat[r, cols["vf"]]) if "vf" in cols else None
+        cat_raw = raw.iat[r, cols["cat"]] if "cat" in cols else None
+        inbound = []
+        for ic in inbound_cols:
+            q = to_num(raw.iat[r, ic["col"]])
+            if q and q > 0:
+                inbound.append((ic["arrival"], q, ic["arr_est"], ic["group"], ic["order"]))
+        rows.append(dict(
+            key=clean_txt(raw.iat[r, cols["name"]]),
+            name=str(raw.iat[r, cols["name"]]).strip(),
+            cat=str(cat_raw).strip() if clean_txt(cat_raw) else "기타",
+            moq=to_num(moq_raw), moq_all=clean_txt(moq_raw) == "전량",
+            vf=vf,
+            main=(to_num(raw.iat[r, cols["main"]]) or 0.0) if "main" in cols else 0.0,
+            safety=(to_num(raw.iat[r, cols["safety"]]) or 0.0) if "safety" in cols else 0.0,
+            sales={d: (to_num(raw.iat[r, c]) or 0.0) for d, c in date_cols.items() if d in entered},
+            inbound=inbound,
+        ))
 
-        base_year = base_date_input.year
+    missing = [k for k in ("moq", "vf", "main") if k not in cols]
+    return dict(name=sheet_name, year=year, month=month, snapshot=snapshot, rows=rows,
+                entered=sorted(entered), inbound_cols=inbound_cols, unparsed=unparsed, missing=missing)
 
-        if "전체 월 시트 자동 통합" in mode_option and len(sheet_names) > 1:
-            st.info(f"🔗 **{len(sheet_names)}개 시트 자동 연동 중:** {', '.join(sheet_names)}의 출고 데이터를 하나로 연결합니다.")
-            
-            # 모든 시트의 출고 날짜를 통합하는 사전 {품명: {날짜: 출고량}}
-            sku_date_sales = {}
-            sku_latest_info = {}
 
-            # 시트들을 순회하며 데이터 적재 (마지막 시트 정보가 최신 재고/스케줄로 덮어씌워짐)
-            for s_name in sheet_names:
-                df_rows, sku_c, cat_c, moq_c, vf_c, main_c, safe_c, lt_c, trig_c, d_map, in_info = parse_single_sheet(uploaded_file, s_name, base_year)
+@st.cache_data(show_spinner="엑셀 분석 중...")
+def load_workbook(file_bytes: bytes) -> list:
+    import io
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    return [parse_sheet(xl.parse(s, header=None), s, today_kst().year) for s in xl.sheet_names]
 
-                for _, r in df_rows.iterrows():
-                    s_name_val = str(r[sku_c]).strip()
-                    if s_name_val not in sku_date_sales:
-                        sku_date_sales[s_name_val] = {}
 
-                    # 일일 출고 적재
-                    for dt_val, col_i in d_map.items():
-                        q_val = clean_num(r[col_i])
-                        if q_val > 0:
-                            sku_date_sales[s_name_val][dt_val] = q_val
+# ─────────────────────────────── 품목 구성 ───────────────────────────────
+@dataclass
+class Item:
+    name: str
+    cat: str
+    is_milkrun: bool
+    moq: float
+    moq_all: bool
+    moq_missing: bool
+    vf: float
+    main: float
+    safety: float
+    adu: float
+    adu_days: int
+    lt: int
+    lt_src: str
+    inbound: list          # [(도착일, 수량, 추정여부)]
+    in_latest: bool
+    sheet: str
+    plan: dict             # {날짜: 수량} 기준일 이후 시트에 미리 입력된 출고(쿠팡 PO 예정)
+    plan_until: object     # 예정 출고가 입력된 마지막 날짜 (없으면 None)
 
-                    # 최신 시트 메타데이터 갱신
-                    cat_val = str(r[cat_c]).strip() if cat_c is not None and pd.notna(r[cat_c]) else "기타"
-                    moq_val = clean_num(r[moq_c]) if moq_c is not None else 100.0
-                    vf_val = clean_num(r[vf_c]) if vf_c is not None else 0.0
-                    main_val = clean_num(r[main_c]) if main_c is not None else 0.0
-                    safe_val = clean_num(r[safe_c]) if safe_c is not None else 0.0
-                    lt_val = clean_num(r[lt_c]) if lt_c is not None else 0.0
-                    trig_val = clean_num(r[trig_c]) if trig_c is not None else 0.0
 
-                    inbounds = []
-                    for ic_idx, m, d in in_info:
-                        qty = clean_num(r[ic_idx])
-                        if qty > 0:
-                            y = base_year if m >= base_date_input.month else base_year + 1
-                            in_d = datetime(y, m, d).date()
-                            if in_d >= base_date_input:
-                                inbounds.append((in_d, int(qty)))
-                    inbounds.sort(key=lambda x: x[0])
+def calc_adu(sales: dict, entered: list, base: date, window: int):
+    """기준일 이전에 '입력된 날' 중 최근 window일의 평균 (빈 칸은 0, 미입력일은 제외)."""
+    days = [d for d in entered if d < base][-window:]
+    if not days:
+        return 0.0, 0
+    return sum(sales.get(d, 0.0) for d in days) / len(days), len(days)
 
-                    sku_latest_info[s_name_val] = {
-                        "구분": cat_val,
-                        "평택(본창고)": int(main_val),
-                        "VF재고": int(vf_val),
-                        "납품MOQ": int(moq_val) if moq_val > 0 else 100,
-                        "안전재고": int(safe_val),
-                        "개별리드타임": int(lt_val) if lt_val > 0 else int(default_lead_time),
-                        "개별트리거": int(trig_val) if trig_val > 0 else int(default_vf_trigger),
-                        "입고스케줄": inbounds
-                    }
 
-            # 통합 품목 리스트 구성
-            processed_items = []
-            calc_days = int(recent_days_window)
-            target_dates = [base_date_input - timedelta(days=d) for d in range(1, calc_days + 1)]
+def estimate_lead_times(sheets: list) -> dict:
+    pairs = {}
+    for sh in sheets:
+        for c in sh["inbound_cols"]:
+            if c["order"]:
+                pairs.setdefault(c["group"], {})[(c["order"], c["arrival"])] = c["est"]
+    out = {}
+    for g, d in pairs.items():
+        exact = [(a - o).days for (o, a), est in d.items() if not est]
+        use = exact or [(a - o).days for (o, a) in d]
+        out[g] = dict(median=int(statistics.median(use)), n=len(use), n_exact=len(exact))
+    return out
 
-            for s_name_val, meta in sku_latest_info.items():
-                sales_dict = sku_date_sales.get(s_name_val, {})
-                # 기준일자 직전 7일 출고량 합산
-                recent_sum = sum([sales_dict.get(t_d, 0.0) for t_d in target_dates])
-                adu = recent_sum / float(calc_days)
 
-                item_entry = {"품명": s_name_val, "일출고량": adu}
-                item_entry.update(meta)
-                processed_items.append(item_entry)
+def build_items(sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_keyword, include_stale, use_plan=True):
+    sheets = sorted(sheets, key=lambda s: (s["year"], s["month"]))
+    latest = sheets[-1]["name"]
+    entered = sorted({d for s in sheets for d in s["entered"]})
+    lt_est = estimate_lead_times(sheets)
+    acc = {}
+    for sh in sheets:                                   # 나중 월 시트가 재고/MOQ/입고 스케줄을 덮어씀
+        for r in sh["rows"]:
+            a = acc.setdefault(r["key"], dict(sales={}, groups=set()))
+            a["sales"].update(r["sales"])
+            a["groups"] |= {g for (_, _, _, g, _) in r["inbound"]}
+            a["row"], a["sheet"] = r, sh["name"]
+    items = []
+    for a in acc.values():
+        r, in_latest = a["row"], a["sheet"] == latest
+        if not in_latest and not include_stale:
+            continue
+        is_mr = mr_keyword in r["cat"]
+        adu, n = calc_adu(a["sales"], entered, base, win_mr if is_mr else win_std)
+        lt, src = int(default_lt), "기본값"
+        if use_hist_lt:
+            c = [(lt_est[g]["median"], g, lt_est[g]["n"]) for g in a["groups"] if g in lt_est]
+            if c:
+                v, g, cnt = max(c)
+                lt, src = v, f"실적 {g} (n={cnt})"
+        moq_missing = not r["moq_all"] and not (r["moq"] and r["moq"] > 0)
+        plan = {d: q for d, q in a["sales"].items() if d >= base and q > 0} if use_plan else {}
+        items.append(Item(
+            name=r["name"], cat=r["cat"], is_milkrun=is_mr,
+            moq=float(r["moq"]) if r["moq"] and r["moq"] > 0 else float(DEFAULT_MOQ),
+            moq_all=r["moq_all"], moq_missing=moq_missing,
+            vf=0.0 if is_mr else float(r["vf"] or 0.0), main=float(r["main"]), safety=float(r["safety"]),
+            adu=adu, adu_days=n, lt=lt, lt_src=src,
+            inbound=sorted((d, q, e) for (d, q, e, _, _) in r["inbound"]),
+            in_latest=in_latest, sheet=a["sheet"],
+            plan=plan, plan_until=max(plan) if plan else None,
+        ))
+    return items, latest, entered, lt_est
 
-            df_items = pd.DataFrame(processed_items)
-            period_desc = f"{target_dates[-1].strftime('%m/%d')} ~ {target_dates[0].strftime('%m/%d')} (다중 시트 연속 {calc_days}일 평균)"
 
-        else:
-            # 단일 시트 모드
-            selected_sheet = st.sidebar.selectbox("조회할 시트 선택:", sheet_names, index=0)
-            df_rows, sku_c, cat_c, moq_c, vf_c, main_c, safe_c, lt_c, trig_c, d_map, in_info = parse_single_sheet(uploaded_file, selected_sheet, base_year)
+# ─────────────────────────────── 시뮬레이션 ───────────────────────────────
+def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: float,
+             po_mult: int, transfer_days: int, horizon: int = HORIZON, log: bool = False) -> dict:
+    """
+    무발주(신규 공장 발주 없음) 기준으로 평택/VF 재고를 일 단위로 굴린다.
+      밀크런형: 평택이 일평균 출고만큼 직접 감소
+      VF형    : VF가 출고로 감소 → VF(+이동중) < 트리거 이면 쿠팡 PO(MOQ×배수)만큼 평택→VF 이동
+    """
+    main, vf = item.main, item.vf
+    inbound = {}
+    for d, q, _ in item.inbound:
+        if d >= base:
+            inbound[d] = inbound.get(d, 0.0) + q
+    unit = None if item.moq_all else item.moq * po_mult
+    trig = trig_value * adu if trig_mode == "days" else float(trig_value)
+    pipe, events = [], []
+    res = dict(first_po=None, stockout=None, short_days=[], n_po=0)
+    main_s, vf_s, lost_s, lost = [], [], [], 0.0
 
-            target_calc_dates = []
-            for d_back in range(1, int(recent_days_window) + 1):
-                check_d = base_date_input - timedelta(days=d_back)
-                if check_d in d_map:
-                    target_calc_dates.append((check_d, d_map[check_d]))
-
-            if not target_calc_dates and (base_date_input in d_map):
-                target_calc_dates.append((base_date_input, d_map[base_date_input]))
-
-            period_desc = f"{target_calc_dates[-1][0].strftime('%m/%d')} ~ {target_calc_dates[0][0].strftime('%m/%d')} ({len(target_calc_dates)}일간)" if target_calc_dates else "날짜 컬럼 불일치"
-
-            processed_items = []
-            for _, r in df_rows.iterrows():
-                item_name = str(r[sku_c]).strip()
-                item_cat = str(r[cat_c]).strip() if cat_c is not None and pd.notna(r[cat_c]) else "기타"
-                item_moq = clean_num(r[moq_c]) if moq_c is not None else 100.0
-                item_vf = clean_num(r[vf_c]) if vf_c is not None else 0.0
-                item_main = clean_num(r[main_c]) if main_c is not None else 0.0
-                item_safety = clean_num(r[safe_c]) if safe_c is not None else 0.0
-                item_lt = clean_num(r[lt_c]) if lt_c is not None else 0.0
-                item_trig = clean_num(r[trig_c]) if trig_c is not None else 0.0
-
-                applied_lt = int(item_lt) if item_lt > 0 else int(default_lead_time)
-                applied_trig = int(item_trig) if item_trig > 0 else int(default_vf_trigger)
-
-                if target_calc_dates:
-                    sum_sales = sum([clean_num(r[c_idx]) for _, c_idx in target_calc_dates])
-                    adu = sum_sales / float(len(target_calc_dates))
+    for i in range(horizon):
+        day = base + timedelta(days=i)
+        q = inbound.get(day, 0.0)
+        if q:
+            main += q
+            if log:
+                events.append((day, f"🚚 [평택 입고] +{q:,.0f}개", main, vf))
+        if pipe:
+            arr = sum(x for t, x in pipe if t <= i)
+            if arr:
+                vf += arr
+                pipe = [(t, x) for t, x in pipe if t > i]
+                if log:
+                    events.append((day, f"📥 [VF 도착] +{arr:,.0f}개 (쿠팡 PO 이동분)", main, vf))
+        demand = adu
+        if item.plan_until and day <= item.plan_until:      # 예정 출고가 입력된 기간은 그 값을 그대로 사용
+            demand = item.plan.get(day, 0.0)
+            if log and demand > 0 and item.is_milkrun:
+                events.append((day, f"📤 [쿠팡 밀크런 출고 예정] -{demand:,.0f}개", max(main - demand, 0.0), vf))
+        if demand > 0:
+            if item.is_milkrun:
+                if main >= demand:
+                    main -= demand
                 else:
-                    adu = 0.0
-
-                inbounds = []
-                for ic_idx, m, d in in_info:
-                    qty = clean_num(r[ic_idx])
-                    if qty > 0:
-                        y = base_year if m >= base_date_input.month else base_year + 1
-                        in_d = datetime(y, m, d).date()
-                        if in_d >= base_date_input:
-                            inbounds.append((in_d, int(qty)))
-                inbounds.sort(key=lambda x: x[0])
-
-                processed_items.append({
-                    "구분": item_cat,
-                    "품명": item_name,
-                    "평택(본창고)": int(item_main),
-                    "VF재고": int(item_vf),
-                    "납품MOQ": int(item_moq) if item_moq > 0 else 100,
-                    "안전재고": int(item_safety),
-                    "개별리드타임": applied_lt,
-                    "개별트리거": applied_trig,
-                    "일출고량": adu,
-                    "입고스케줄": inbounds
-                })
-
-            df_items = pd.DataFrame(processed_items)
-
-        # 2. 카테고리 필터
-        st.divider()
-        all_cats = ["전체 보기"] + [c for c in df_items["구분"].unique() if c not in ["nan", "", "기타"]] + ["기타"]
-        all_cats = list(dict.fromkeys(all_cats))
-        selected_cat = st.selectbox("📂 구분(카테고리) 필터:", all_cats)
-
-        view_items = df_items if selected_cat == "전체 보기" else df_items[df_items["구분"] == selected_cat]
-
-        # 3. 전 품목 시뮬레이션 연산
-        sim_days = 90
-        sim_dates = [base_date_input + timedelta(days=i) for i in range(sim_days)]
-        master_table_rows = []
-
-        for _, item in view_items.iterrows():
-            c_main = item["평택(본창고)"]
-            c_vf = item["VF재고"]
-            moq = item["납품MOQ"]
-            adu = item["일출고량"]
-            safety = item["안전재고"]
-            lt = item["개별리드타임"]
-            trig = item["개별트리거"]
-            inbounds = item["입고스케줄"]
-
-            has_safety = safety > 0
-            limit_target = safety if has_safety else 0
-
-            main_breach_day = None
-            first_po_day = None
-
-            for d_i in range(sim_days):
-                curr_d = sim_dates[d_i]
-
-                for in_d, in_q in inbounds:
-                    if in_d == curr_d:
-                        c_main += in_q
-
-                if adu > 0:
-                    c_vf -= adu
-
-                if adu > 0 and c_vf < trig:
-                    if first_po_day is None:
-                        first_po_day = curr_d
-
-                    if c_main >= moq:
-                        c_main -= moq
-                        c_vf += moq
-
-                        if has_safety and c_main <= limit_target and main_breach_day is None:
-                            main_breach_day = d_i
-                    else:
-                        if main_breach_day is None:
-                            main_breach_day = d_i
-                        c_vf += c_main
-                        c_main = 0
-
-            if adu == 0:
-                status = "💤 출고없음 (안전)"
-                po_txt = "-"
-                breach_txt = "고갈없음"
-                deadline_txt = "-"
-                d_day_val = 999
-            elif main_breach_day is None:
-                status = "✅ [안정] 90일 이상 여유"
-                po_txt = first_po_day.strftime('%m/%d') if first_po_day else "-"
-                breach_txt = "90일 이상 버팀"
-                deadline_txt = "여유"
-                d_day_val = 999
+                    lost += demand - main
+                    main = 0.0
+                    res["short_days"].append(i)
+                    if res["stockout"] is None:
+                        res["stockout"] = i
+                        if log:
+                            events.append((day, "🚨 [평택 결품] 밀크런 출고 물량 부족", main, vf))
             else:
-                b_date = sim_dates[main_breach_day]
-                breach_txt = f"{b_date.strftime('%m/%d')} (D+{main_breach_day}일)"
-                order_deadline = b_date - timedelta(days=lt)
-                deadline_txt = order_deadline.strftime('%Y-%m-%d')
-                d_day_val = (order_deadline - base_date_input).days
-                po_txt = first_po_day.strftime('%m/%d') if first_po_day else "-"
-
-                if d_day_val <= 0:
-                    status = "🚨 [초긴급] 지금 즉시 발주!"
-                elif d_day_val <= 7:
-                    status = f"⚠️ [긴급] D-{d_day_val}일 내 발주"
-                elif d_day_val <= 14:
-                    status = f"🔔 [준비] D-{d_day_val}일 발주준비"
+                if vf >= demand:
+                    vf -= demand
                 else:
-                    status = f"✅ [안정] D-{d_day_val}일 여유"
+                    lost += demand - vf
+                    vf = 0.0
+                transit = sum(x for _, x in pipe)
+                short_today = False
+                for _ in range(20):
+                    if vf + transit >= trig or main <= 1e-9:
+                        break
+                    qty = main if item.moq_all else min(unit, main)
+                    if not item.moq_all and main < unit:
+                        short_today = True
+                    main -= qty
+                    if transfer_days > 0:
+                        pipe.append((i + transfer_days, qty))
+                        transit += qty
+                    else:
+                        vf += qty
+                    res["n_po"] += 1
+                    res["first_po"] = res["first_po"] or day
+                    if log:
+                        tag = "" if item.moq_all or qty >= unit else " (MOQ 미달, 잔량 전부)"
+                        events.append((day, f"📦 쿠팡 PO: 평택 -{qty:,.0f}개 → VF{tag}", main, vf))
+                    if item.moq_all:
+                        break
+                if vf + transit < trig and main <= 1e-9:
+                    short_today = True
+                if short_today:
+                    res["short_days"].append(i)
+                    if res["stockout"] is None:
+                        res["stockout"] = i
+                        if log:
+                            events.append((day, "🚨 [평택 결품] 쿠팡 PO를 채울 재고 부족", main, vf))
+        main_s.append(main)
+        vf_s.append(vf)
+        lost_s.append(lost)
+    res.update(main=main_s, vf=vf_s, lost=lost_s, events=events)
+    return res
 
-            master_table_rows.append({
-                "구분": item["구분"],
-                "품명": item["품명"],
-                "평택(본창고)": f"{item['평택(본창고)']:,}개",
-                "VF재고": f"{item['VF재고']:,}개",
-                "납품MOQ": f"{moq:,}개",
-                "안전재고": f"{safety:,}개" if has_safety else "미적용",
-                "일일판매량": f"{adu:.1f}개/일",
-                "적용L/T": f"{lt}일",
-                "차기 쿠팡PO예정일": po_txt,
-                "평택재고 고갈일": breach_txt,
-                "공장발주 데드라인": deadline_txt,
-                "발주상태": status,
-                "raw_name": item["품명"],
-                "d_day_num": d_day_val
-            })
 
-        summary_df = pd.DataFrame(master_table_rows)
-        sorted_table = summary_df.drop(columns=["raw_name", "d_day_num"]).sort_values(by="발주상태").reset_index(drop=True)
-        sorted_table.index = sorted_table.index + 1
+def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: int, target_days: int) -> dict:
+    """시뮬레이션 결과 → 데드라인 / 상태 / 권장 발주량."""
+    ms, n = sim["main"], len(sim["main"])
+    safety_day = None
+    if safety > 0:                       # 지금 발주해도 lt일 뒤에야 도착 → lt일 이후 구간의 안전재고 이탈만 '발주로 막을 수 있음'
+        safety_day = next((i for i in range(min(lt, n), n) if ms[i] <= safety), None)
+    stock = sim["stockout"]
+    d_stock = None if stock is None else stock - lt
+    d_safe = None if safety_day is None else safety_day - lt
+    ds = [x for x in (d_stock, d_safe) if x is not None]
+    d_pol = min(ds) if ds else None
+    delayed = sum(1 for i in sim["short_days"] if i < lt)
 
-        u_cnt = len(summary_df[summary_df["발주상태"].str.contains("초긴급")])
-        w_cnt = len(summary_df[summary_df["발주상태"].str.contains("긴급|준비")])
+    has_demand = adu > 0 or bool(item.plan)
+    if not has_demand:
+        tier, status = 5, "💤 출고없음"
+    elif d_stock is not None and d_stock < 0:
+        tier, status = 0, f"🚨 결품 예상 – 신규 발주로는 방지 불가 (평택 부족 {delayed}일)"
+    elif d_pol is None:
+        tier, status = 4, f"✅ 안정 ({n}일 내 이상 없음)"
+    elif d_pol <= 0:
+        tier, status = 1, "🚨 오늘 발주"
+    elif d_pol <= 7:
+        tier, status = 2, f"⚠️ 긴급 D-{d_pol}"
+    elif d_pol <= 14:
+        tier, status = 3, f"🔔 준비 D-{d_pol}"
+    else:
+        tier, status = 4, f"✅ 여유 D-{d_pol}"
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("📅 기준일자", base_date_input.strftime("%Y-%m-%d"))
-        k2.metric("📊 출고 평균 산출 구간", period_desc)
-        k3.metric("🚨 즉시 공장 발주 필요", f"{u_cnt} 개 SKU", delta_color="inverse")
-        k4.metric("⚠️ 14일 내 발주 예정", f"{w_cnt} 개 SKU")
+    # 권장 발주량: 신규 발주분이 도착하는 lt일 이후 target_days 동안
+    #   평택 재고가 기준선(안전재고, 없으면 0) 아래로 내려가거나 미충족 출고가 생기는 최대 부족분
+    qty = 0.0
+    if has_demand and lt < n:
+        floor = safety if safety > 0 else 0.0
+        base_lost = sim["lost"][lt - 1] if lt >= 1 else 0.0
+        end = min(n, lt + target_days + 1)
+        qty = max(0.0, max(floor - ms[i] + (sim["lost"][i] - base_lost) for i in range(lt, end)))
+        if not item.moq_all and item.moq > 0:
+            qty = math.ceil(qty / item.moq - 1e-9) * item.moq
+    return dict(tier=tier, status=status, d_pol=d_pol, d_stock=d_stock, safety_day=safety_day,
+                deadline=(base + timedelta(days=d_pol)) if d_pol is not None else None, rec_qty=int(round(qty)))
 
-        st.subheader("📋 전체 품목 쿠팡 PO 연동 및 평택창고 발주 데드라인 마스터 테이블")
-        st.dataframe(sorted_table, use_container_width=True)
 
-        # 4. 하단 개별 SKU 시뮬레이터
-        st.divider()
-        st.subheader("🔍 개별 SKU 쿠팡 PO 차감 타임라인 & 재고 곡선")
+def fmt_md(base: date, offset):
+    return "-" if offset is None else (base + timedelta(days=offset)).strftime("%m/%d")
 
-        selected_sku = st.selectbox("정밀 조회할 품목을 선택하세요:", df_items["품명"].unique())
-        target_item = df_items[df_items["품명"] == selected_sku].iloc[0]
 
-        s1, s2, s3, s4, s5 = st.columns(5)
-        with s1:
-            p_trig = st.number_input("쿠팡 PO 트리거 (VF 잔여)", min_value=0, value=int(target_item["개별트리거"]), step=10)
-        with s2:
-            p_mult = st.selectbox("쿠팡 PO 배수", [1, 2, 3], format_func=lambda x: f"{x}배수 ({target_item['납품MOQ']*x:,}개)")
-            active_po_unit = target_item['납품MOQ'] * p_mult
-        with s3:
-            p_adu = st.number_input("일일 고객 출고량 (개/일)", min_value=0.0, value=float(target_item["일출고량"]), step=1.0)
-        with s4:
-            p_safety = st.number_input("안전재고 수량 (0이면 품절기준)", min_value=0, value=int(target_item["안전재고"]), step=100)
-        with s5:
-            p_lt = st.number_input("품목 생산 리드타임 (일)", min_value=1, max_value=120, value=int(target_item["개별리드타임"]), step=1)
+# ─────────────────────────────── UI ───────────────────────────────
+_ST_VER = tuple(int(x) for x in re.findall(r"\d+", st.__version__)[:2])
 
-        c_main = target_item["평택(본창고)"]
-        c_vf = target_item["VF재고"]
-        inbound_sched = target_item["입고스케줄"]
 
-        hist_main = []
-        hist_vf = []
-        event_logs = []
-        ind_breach = None
-        ind_first_po = None
+def wide(fn, *args, **kw):
+    """Streamlit 버전별 '가로 꽉 채우기' 인자 차이 흡수."""
+    order = ({"width": "stretch"}, {"use_container_width": True}) if _ST_VER >= (1, 50) \
+        else ({"use_container_width": True}, {"width": "stretch"})
+    for extra in order:
+        try:
+            return fn(*args, **kw, **extra)
+        except Exception:
+            continue
+    return fn(*args, **kw)
 
-        for d_i in range(sim_days):
-            curr_d = sim_dates[d_i]
 
-            for in_d, in_q in inbound_sched:
-                if in_d == curr_d:
-                    c_main += in_q
-                    event_logs.append((curr_d, f"🚚 [평택 입고] +{in_q:,}개 공장 입고 완료", c_main, c_vf))
+def main():
+    st.set_page_config(layout="wide", page_title="쿠팡 VF & 평택 마스터 발주 대시보드")
+    st.title("📦 쿠팡 VF & 평택물류 통합 마스터 발주 시스템")
+    st.caption("월별 시트 자동 연동 · 실적 기반 리드타임 · 쿠팡 PO 차감 시뮬레이션 · 안전재고/결품 기준 공장 발주 데드라인")
 
-            if p_adu > 0:
-                c_vf -= p_adu
-
-            if p_adu > 0 and c_vf < p_trig:
-                if ind_first_po is None:
-                    ind_first_po = curr_d
-
-                if c_main >= active_po_unit:
-                    c_main -= active_po_unit
-                    c_vf += active_po_unit
-
-                    if p_safety > 0 and c_main <= p_safety and ind_breach is None:
-                        ind_breach = d_i
-
-                    event_logs.append((curr_d, f"📦 쿠팡 PO 차감: -{active_po_unit:,}개 ➔ 평택잔여: {c_main:,}개", c_main, c_vf))
-                else:
-                    if ind_breach is None:
-                        ind_breach = d_i
-                    event_logs.append((curr_d, f"🚨 [평택 결품] PO {active_po_unit:,}개 중 잔여 {c_main:,}개만 VF 이동", 0, c_vf + c_main))
-                    c_vf += c_main
-                    c_main = 0
-
-            hist_main.append(c_main)
-            hist_vf.append(max(c_vf, 0))
-
-        st.markdown(f"#### 📈 [{selected_sku}] 향후 60일 평택본창고 vs VF 재고 흐름 (리드타임: {p_lt}일 적용)")
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=sim_dates[:60], y=hist_main[:60], mode="lines+markers", name="평택본창고 (쿠팡 PO 시 계단식 차감)", line=dict(color="#1f77b4", width=3)))
-        fig.add_trace(go.Scatter(x=sim_dates[:60], y=hist_vf[:60], mode="lines", name="VF 잔여재고 (고객 일일출고로 차감)", line=dict(color="#ff7f0e", width=2, dash="dash")))
-
-        if p_safety > 0:
-            fig.add_hline(y=p_safety, line_dash="dashdot", line_color="#ffbb00", annotation_text=f"안전재고 마지노선 ({p_safety:,}개)")
-        fig.add_hline(y=p_trig, line_dash="dot", line_color="red", annotation_text=f"쿠팡 발주 트리거 ({p_trig}개)")
-
-        fig.update_layout(xaxis_title="일자", yaxis_title="수량 (개)", hovermode="x unified", margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("📅 일자별 쿠팡 PO 발생 및 평택창고 이동 타임라인"):
-            if event_logs:
-                st.dataframe(pd.DataFrame(event_logs, columns=["일자", "내용", "평택 잔여", "VF 잔여"]), use_container_width=True)
-
+    st.sidebar.header("📁 엑셀 파일 업로드")
+    up = st.sidebar.file_uploader("통합 마스터 엑셀 업로드 (.xlsx)", type=["xlsx"])
+    if not up:
+        st.info("👈 왼쪽 사이드바에서 마스터 엑셀 파일을 업로드해 주세요.")
+        return
+    raw_bytes = up.getvalue()
+    sig = hashlib.md5(raw_bytes).hexdigest()[:8]
+    try:
+        sheets = load_workbook(raw_bytes)
     except Exception as e:
-        st.error(f"오류가 발생했습니다: {e}")
-else:
-    st.info("👈 왼쪽 사이드바에서 마스터 엑셀 파일을 업로드해 주세요.")
+        st.error("엑셀을 읽는 중 오류가 발생했습니다.")
+        st.exception(e)
+        return
+    sheets = [s for s in sheets if s["rows"]]
+    if not sheets:
+        st.error("품목 행을 찾지 못했습니다. 헤더에 '품명' 컬럼이 있는지 확인해 주세요.")
+        return
+    bad = [f"{s['name']}: {', '.join(s['missing'])}" for s in sheets if s["missing"]]
+    if bad:
+        st.warning("일부 컬럼을 인식하지 못했습니다 (해당 값은 0으로 처리) → " + " / ".join(bad))
+
+    snaps = [s["snapshot"] for s in sheets if s["snapshot"]]
+    snapshot = max(snaps) if snaps else None
+
+    st.sidebar.divider()
+    st.sidebar.header("⚙️ 발주 및 시뮬레이션 기본값")
+    base = st.sidebar.date_input(
+        "재고/출고 기준일자", snapshot or today_kst(), key=f"base_{sig}",
+        help="재고 수량이 입력된 날짜입니다. 기본값은 엑셀 헤더의 기준일(=TODAY() 저장값), 없으면 오늘(KST).")
+    if snapshot and abs((today_kst() - snapshot).days) >= 2:
+        st.sidebar.warning(f"엑셀 기준일은 {snapshot:%m/%d}, 오늘은 {today_kst():%m/%d} 입니다. 재고가 최신인지 확인하세요.")
+    win_std = st.sidebar.number_input("출고 평균 기간 – 일반(벤플 등, 일)", 1, 60, 7)
+    win_mr = st.sidebar.number_input("출고 평균 기간 – 밀크런(일)", 1, 60, 28,
+                                     help="밀크런은 PO 단위로 몰아서 나가서 7일 평균은 0이 되기 쉽습니다.")
+    mr_kw = st.sidebar.text_input("밀크런 구분 키워드", "밀크런")
+    default_lt = st.sidebar.number_input("기본 리드타임 (일)", 1, 120, 35)
+    use_hist_lt = st.sidebar.checkbox("발주일→입고일 이력으로 리드타임 자동 추정", True,
+                                      help="엑셀의 '발주일/입고일' 쌍에서 품목군별 중앙값을 계산해 적용합니다.")
+    trig_mode_label = st.sidebar.radio("쿠팡 PO 트리거 방식", ["VF 잔여일수 기준", "고정 수량 기준"])
+    trig_mode = "days" if trig_mode_label.startswith("VF") else "units"
+    if trig_mode == "days":
+        trig_value = st.sidebar.number_input("VF 잔여 며칠분 밑이면 PO?", 1, 60, 10,
+                                             help="가정값입니다. 실제 쿠팡 PO 발생 이력으로 보정하세요.")
+    else:
+        trig_value = st.sidebar.number_input("VF 잔여 수량 트리거 (개)", 0, 100000, 200, step=10)
+    po_mult = st.sidebar.selectbox("쿠팡 PO 배수", [1, 2, 3], format_func=lambda x: f"MOQ × {x}")
+    transfer_days = st.sidebar.number_input("평택→VF 이동 소요일", 0, 14, 0)
+    target_days = st.sidebar.number_input("권장 발주량 산정 기간 (일)", 7, 120, 45,
+                                          help="신규 발주분이 도착한 뒤 이 기간 동안 부족이 없도록 산정합니다.")
+    use_plan = st.sidebar.checkbox("시트에 미리 입력된 미래 출고(쿠팡 PO 예정) 반영", True,
+                                   help="기준일 이후 날짜 칸에 이미 수량이 적혀 있으면 그 기간은 평균 대신 그 값을 그대로 출고로 사용합니다.")
+    include_stale = st.sidebar.checkbox("최신 월 시트에 없는 품목도 포함", False)
+
+    items, latest, entered, lt_est = build_items(
+        sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_kw, include_stale, use_plan)
+    if not items:
+        st.error("표시할 품목이 없습니다.")
+        return
+    excluded = sorted({r["name"] for s in sheets for r in s["rows"]} - {i.name for i in items})
+
+    # ── 전 품목 계산
+    calc = {}
+    for it in items:
+        sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
+        calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days))
+
+    rows = []
+    for it in items:
+        sim, ev = calc[it.name]
+        total = it.main + it.vf
+        rows.append({
+            "_tier": ev["tier"], "_dpol": ev["d_pol"] if ev["d_pol"] is not None else 9999,
+            "구분": it.cat, "품명": it.name, "유형": "밀크런" if it.is_milkrun else "VF",
+            "평택재고": int(it.main), "VF재고": None if it.is_milkrun else int(it.vf),
+            "안전재고": int(it.safety) if it.safety > 0 else None,
+            "안전재고 대비(%)": round(it.main / it.safety * 100) if it.safety > 0 else None,
+            "일평균출고": round(it.adu, 1), "재고커버(일)": round(total / it.adu) if it.adu > 0 else None,
+            "적용L/T(일)": it.lt, "L/T 근거": it.lt_src,
+            "차기 쿠팡PO": fmt_md(base, (sim["first_po"] - base).days) if sim["first_po"] else "-",
+            "안전재고 이탈일": fmt_md(base, ev["safety_day"]), "평택 결품일": fmt_md(base, sim["stockout"]),
+            "발주 데드라인": ev["deadline"].strftime("%m/%d") if ev["deadline"] else "-",
+            "발주상태": ev["status"], "권장 발주량": ev["rec_qty"] if it.adu > 0 else None,
+            "입고예정(합)": int(sum(q for d, q, _ in it.inbound if d >= base)) or None,
+            "출고예정(합)": int(sum(it.plan.values())) or None,
+        })
+    df = pd.DataFrame(rows)
+
+    st.divider()
+    cats = ["전체 보기"] + sorted(df["구분"].unique())
+    sel_cat = st.selectbox("📂 구분(카테고리) 필터:", cats)
+    view = df if sel_cat == "전체 보기" else df[df["구분"] == sel_cat]
+    view = view.sort_values(["_tier", "_dpol"]).reset_index(drop=True)
+
+    std_days = [d for d in entered if d < base][-win_std:]
+    mr_days = [d for d in entered if d < base][-win_mr:]
+    period = f"{std_days[0]:%m/%d}~{std_days[-1]:%m/%d} ({len(std_days)}일)" if std_days else "날짜 컬럼 없음"
+    if mr_days:
+        period += f" · 밀크런 {len(mr_days)}일"
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("📅 기준일자", f"{base:%Y-%m-%d}")
+    k2.metric("📊 출고 평균 구간", period)
+    k3.metric("🚨 즉시/지연 발주", f"{int((view['_tier'] <= 1).sum())} 개 SKU")
+    k4.metric("⚠️ 14일 내 발주", f"{int(view['_tier'].isin([2, 3]).sum())} 개 SKU")
+
+    notes = []
+    est_cnt = sum(1 for it in items for _, _, e in it.inbound if e)
+    if est_cnt:
+        notes.append(f"입고일이 '11월초/12월 중순' 같은 표현인 {est_cnt}건은 순의 끝날(초=10일, 중순=20일, 말=말일)로 보수적으로 추정했습니다.")
+    for sh in sheets:
+        if sh["unparsed"]:
+            notes.append(f"[{sh['name']}] 날짜를 해석하지 못한 입고 컬럼: {', '.join(sh['unparsed'])}")
+    if excluded:
+        notes.append(f"최신 시트({latest})에 없어 제외한 품목 {len(excluded)}개: {', '.join(excluded)}")
+    planned = [i for i in items if i.plan]
+    if planned:
+        last = max(i.plan_until for i in planned)
+        notes.append(f"기준일 이후 날짜에 이미 입력된 출고 수량({len(planned)}개 품목, ~{last:%m/%d})은 쿠팡 PO 예정으로 보고 "
+                     "그 기간의 출고로 그대로 사용했습니다. 예정이 아니라면 사이드바에서 반영을 끄세요.")
+    if any(i.moq_all for i in items):
+        notes.append("납품 MOQ가 '전량'인 품목은 PO 시 평택 재고 전부를 VF로 보내는 것으로 계산합니다.")
+    if any(i.moq_missing for i in items):
+        notes.append(f"MOQ가 비어 있는 품목은 임시로 {DEFAULT_MOQ}개로 계산했습니다.")
+    if notes:
+        with st.expander(f"🔎 데이터 점검 사항 ({len(notes)})", expanded=False):
+            for n in notes:
+                st.write("• " + n)
+            if lt_est:
+                st.write("**발주→입고 실적 리드타임 (품목군별 중앙값)**")
+                st.dataframe(pd.DataFrame([{"품목군": g, "중앙값(일)": v["median"], "표본수": v["n"], "정확한 날짜 쌍": v["n_exact"]}
+                                           for g, v in lt_est.items()]), hide_index=True)
+
+    st.subheader("📋 전체 품목 발주 데드라인 마스터 테이블")
+    show = view.drop(columns=["_tier", "_dpol", "L/T 근거"])
+    wide(st.dataframe, show, hide_index=True)
+    st.caption("발주 데드라인 = min(안전재고 이탈일, 평택 결품일) − 리드타임. 안전재고 이탈은 신규 발주분이 도착하는 리드타임 이후 구간만 봅니다. "
+               "권장 발주량은 도착 후 산정 기간 동안 안전재고(미기재 품목은 결품 방지) 기준 최대 부족분을 납품 MOQ 배수로 올림한 값입니다.")
+
+    # ── 개별 SKU 시뮬레이터
+    st.divider()
+    st.subheader("🔍 개별 SKU 쿠팡 PO 차감 타임라인 & 재고 곡선")
+    names = list(view["품명"])
+    sku = st.selectbox("정밀 조회할 품목:", names)
+    it = next(i for i in items if i.name == sku)
+    h = hashlib.md5(sku.encode()).hexdigest()[:6]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        if trig_mode == "days":
+            p_trig = st.number_input("PO 트리거 (VF 잔여 일수)", 1, 60, int(trig_value), key=f"tg_{h}")
+        else:
+            p_trig = st.number_input("PO 트리거 (VF 잔여 수량)", 0, 100000, int(trig_value), step=10, key=f"tg_{h}")
+    with c2:
+        p_mult = st.selectbox("쿠팡 PO 배수", [1, 2, 3], index=[1, 2, 3].index(po_mult), key=f"mu_{h}",
+                              format_func=lambda x: "전량" if it.moq_all else f"{x}배수 ({it.moq * x:,.0f}개)")
+    with c3:
+        p_adu = st.number_input("일일 출고량 (개/일)", 0.0, 1e6, float(round(it.adu, 2)), step=1.0, key=f"adu_{h}")
+    with c4:
+        p_safe = st.number_input("안전재고 (0이면 결품 기준)", 0, 10_000_000, int(it.safety), step=100, key=f"sf_{h}")
+    with c5:
+        p_lt = st.number_input("리드타임 (일)", 1, 120, int(it.lt), key=f"lt_{h}")
+    p_tr = st.number_input("평택→VF 이동 소요일", 0, 14, int(transfer_days), key=f"tr_{h}") if not it.is_milkrun else 0
+    st.caption(f"L/T 근거: {it.lt_src} · 출고평균 {it.adu_days}일 기준"
+               + (f" · {it.plan_until:%m/%d}까지는 시트 입력 예정 출고 사용" if it.plan_until else "")
+               + (f" · 시트 안전재고 환산 일평균 {it.safety / 45:,.1f}개/일 (안전재고÷45)" if it.safety > 0 else ""))
+
+    sim = simulate(it, base, p_adu, trig_mode, p_trig, p_mult, p_tr, log=True)
+    ev = evaluate(it, sim, base, p_adu, p_safe, p_lt, target_days)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("발주상태", ev["status"])
+    m2.metric("공장발주 데드라인", ev["deadline"].strftime("%Y-%m-%d") if ev["deadline"] else "-")
+    m3.metric("평택 결품 예상일", fmt_md(base, sim["stockout"]))
+    m4.metric("권장 발주량", f"{ev['rec_qty']:,}개" if p_adu > 0 else "-")
+
+    days = [base + timedelta(days=i) for i in range(CHART_DAYS)]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=days, y=sim["main"][:CHART_DAYS], mode="lines", name="평택본창고",
+                             line=dict(color="#1f77b4", width=3)))
+    if not it.is_milkrun:
+        fig.add_trace(go.Scatter(x=days, y=sim["vf"][:CHART_DAYS], mode="lines", name="VF 잔여재고",
+                                 line=dict(color="#ff7f0e", width=2, dash="dash")))
+    arr = [(d, q) for d, q, _ in it.inbound if base <= d < days[-1]]
+    if arr:
+        fig.add_trace(go.Scatter(x=[d for d, _ in arr], y=[sim["main"][(d - base).days] for d, _ in arr],
+                                 mode="markers", name="공장 입고", marker=dict(symbol="triangle-up", size=12, color="#2ca02c")))
+    if p_safe > 0:
+        fig.add_hline(y=p_safe, line_dash="dashdot", line_color="#ffbb00", annotation_text=f"안전재고 ({p_safe:,})")
+    fig.update_layout(xaxis_title="일자", yaxis_title="수량 (개)", hovermode="x unified",
+                      margin=dict(l=20, r=20, t=30, b=20))
+    st.markdown(f"#### 📈 [{sku}] 향후 {CHART_DAYS}일 재고 흐름 (리드타임 {p_lt}일)")
+    wide(st.plotly_chart, fig)
+
+    with st.expander("📅 일자별 이벤트 로그 / 입고 스케줄"):
+        if sim["events"]:
+            wide(st.dataframe, pd.DataFrame(sim["events"], columns=["일자", "내용", "평택 잔여", "VF 잔여"]).round(0),
+                 hide_index=True)
+        else:
+            st.write("기간 내 이벤트가 없습니다.")
+        if it.inbound:
+            st.write("**공장 입고 스케줄**")
+            st.dataframe(pd.DataFrame([{"입고일": d, "수량": int(q), "날짜": "추정" if e else "확정"} for d, q, e in it.inbound]),
+                         hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
