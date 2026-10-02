@@ -810,8 +810,13 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
             while ii < len(inb) and inb[ii][0] <= e["date"]:
                 stock += inb[ii][1]
                 ii += 1
-            e["deliv"] = min(e["demand"], max(stock, 0.0))
-            stock -= e["deliv"]
+            avail = max(stock, 0.0)
+            if e["kind"] == "확정":         # 이미 받은 PO는 매출에 그대로 넣고, 재고가 모자라면 '납품 위험'으로만 표시
+                e["risk"] = max(0.0, e["demand"] - avail)
+                stock -= e["demand"]        # 모자란 만큼은 이후 입고분에서 먼저 메워야 하는 것으로 봄
+            else:
+                e["deliv"] = min(e["demand"], avail)
+                stock -= e["deliv"]
             e["stock_after"] = stock
     res["events"].sort(key=lambda e: e["date"])
     return res
@@ -1006,10 +1011,11 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
     for f in view:
         it = f["item"]
         sh = [e for e in f["events"] if e["kind"] != "실적" and in_scope(e["date"]) and e["demand"] - e["deliv"] > 1e-9]
-        if not sh:
+        rk = [e for e in f["events"] if e["kind"] == "확정" and in_scope(e["date"]) and e.get("risk", 0) > 1e-9]
+        if not sh and not rk:
             continue
         lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] for e in es) * k
-        first = min(e["date"] for e in sh)
+        first = min(e["date"] for e in sh + rk)
         lt = it.lt if it else None
         cut = base + timedelta(days=lt) if lt else None          # 오늘 공장 발주해도 이 날 전에는 입고 불가
         unrec = [e for e in sh if cut is None or e["date"] < cut]
@@ -1022,18 +1028,23 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
             "미납 PO 건수": len(sh), "첫 미납일": first.strftime("%m/%d" if first.year == base.year else "%y/%m/%d"),
             "평택 재고": int(it.main) if it else None, "발주완료 입고": inb,
             "└ 리드타임 내(못 막음)": int(lost(unrec)), "└ 신규 발주로 회복 가능": int(lost(rec)),
+            "확정 PO 납품 위험": int(sum(e["risk"] * e["price"] for e in rk) * k),
             "리드타임": lt,
             "공장발주 데드라인": (ev["deadline"].strftime("%m/%d") if ev and ev["deadline"] else "-"),
         })
     if not rows:
         st.success("이 범위에서는 재고 부족으로 빠지는 매출이 없습니다.")
         return
-    df = pd.DataFrame(rows).sort_values("빠지는 매출", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    df = df.assign(_s=df["빠지는 매출"] + df["확정 PO 납품 위험"]).sort_values("_s", ascending=False).drop(columns="_s").reset_index(drop=True)
     t, u, r = df["빠지는 매출"].sum(), df["└ 리드타임 내(못 막음)"].sum(), df["└ 신규 발주로 회복 가능"].sum()
-    a, b, c = st.columns(3)
+    rr = df["확정 PO 납품 위험"].sum()
+    a, b, c, d4 = st.columns(4)
     a.metric("빠지는 매출 합계", won(t), help=f"{len(df)}개 품목")
     b.metric("리드타임 안이라 못 막는 금액", won(u), help="오늘 공장 발주해도 리드타임 전에는 입고가 안 되는 기간의 손실")
     c.metric("지금 발주하면 회복 가능한 금액", won(r))
+    d4.metric("확정 PO 중 재고 없는 금액", won(rr),
+              help="이미 받은 확정 PO인데 평택 재고·발주완료 입고분으로는 수량이 안 나오는 금액. 예상 매출에는 그대로 포함돼 있으니 납품 가능 여부를 확인하세요.")
 
     fig = go.Figure()
     lab = [n if len(n) <= 24 else n[:23] + "…" for n in df["품명(PO)"]][::-1]
@@ -1045,7 +1056,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
                       xaxis_title=f"원 ({'VAT 포함' if vat_incl else 'VAT 제외'})", legend=dict(orientation="h", y=-0.15))
     wide(st.plotly_chart, fig)
 
-    ccfg = {c_: num_col(c_) for c_ in ("빠지는 매출", "빠지는 수량", "평택 재고", "└ 리드타임 내(못 막음)", "└ 신규 발주로 회복 가능")}
+    ccfg = {c_: num_col(c_) for c_ in ("빠지는 매출", "빠지는 수량", "평택 재고", "└ 리드타임 내(못 막음)", "└ 신규 발주로 회복 가능", "확정 PO 납품 위험")}
     if _HAS_SELECT:
         event = wide(st.dataframe, df, hide_index=True, column_config=ccfg,
                      on_select="rerun", selection_mode="single-row", key="loss_tbl")
@@ -1060,7 +1071,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
         wide(st.dataframe, df, hide_index=True, column_config=ccfg)
     st.caption("빠지는 매출 = 확정·예측 PO 중 평택 재고(+발주완료 입고분)가 모자라 납품 못 할 수량 × 단가. "
                "첫 미납일 = 재고가 처음 모자라는 PO 날짜. 리드타임 내 = 오늘 공장 발주해도 '기준일+리드타임' 전이라 막을 수 없는 손실, "
-               "그 이후 손실은 지금 발주하면 회복 가능. 공장발주 데드라인은 '재고·공장 발주' 탭 기준입니다. "
+               "그 이후 손실은 지금 발주하면 회복 가능. 확정 PO 납품 위험 = 이미 받은 PO라 매출에는 넣었지만 재고상 수량이 안 나오는 금액. 공장발주 데드라인은 '재고·공장 발주' 탭 기준입니다. "
                "행을 선택하면 아래 SKU 상세에서 PO별 미납 수량을 볼 수 있습니다.")
 
 
@@ -1159,7 +1170,8 @@ def render_po_detail(f, base, sel, months, vat_incl, cfg):
             "PO 수량": int(e["demand"]), "납품(예상)": int(e["deliv"]), "단가": int(e["price"]),
             "매출": int(ev_rev(e, vat_incl)),
             "평택 잔여": int(e["stock_after"]) if "stock_after" in e else None,
-            "비고": ("재고 부족 " + f"{e['demand'] - e['deliv']:,.0f}개 미납" if e["demand"] - e["deliv"] > 1e-9 else ""),
+            "비고": (f"재고 부족 {e['demand'] - e['deliv']:,.0f}개 미납" if e["demand"] - e["deliv"] > 1e-9
+                     else f"⚠️ 재고 {e['risk']:,.0f}개 모자람 (확정 PO, 매출엔 포함)" if e.get("risk", 0) > 1e-9 else ""),
         } for e in ev])
         wide(st.dataframe, tbl, hide_index=True,
              column_config={k: num_col(k) for k in ("PO 수량", "납품(예상)", "단가", "매출", "평택 잔여")})
