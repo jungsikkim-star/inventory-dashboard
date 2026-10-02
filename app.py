@@ -856,7 +856,7 @@ def won(v: float) -> str:
     return f"{v / 1e4:,.0f}만원"
 
 
-def render_po_tab(fcs, base, horizon_end, vat_incl, cfg):
+def render_po_tab(fcs, base, horizon_end, vat_incl, cfg, deadlines=None):
     vat_txt = "VAT 포함" if vat_incl else "VAT 제외(공급가)"
     if not fcs:
         st.info("엑셀에 쿠팡 PO 이력 탭이 없습니다. 헤더에 '날짜'와 '단가'가 있는 탭을 넣으면 자동으로 인식합니다.")
@@ -956,6 +956,8 @@ def render_po_tab(fcs, base, horizon_end, vat_incl, cfg):
                "재고부족 차감 = 수요상 PO는 들어오지만 평택 재고가 모자라 납품 못 할 것으로 보는 금액."
                + (" 토·일 예측분은 월요일로 옮깁니다." if cfg["weekend"] else ""))
 
+    render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines or {})
+
     # ── 월별 매출 추이
     st.subheader("📈 월별 쿠팡 PO 매출 추이 (실적 + 확정 + 예측)")
     y0, m0 = add_months(cur[0], cur[1], -12)
@@ -986,6 +988,80 @@ def render_po_tab(fcs, base, horizon_end, vat_incl, cfg):
     st.subheader("🔍 SKU 상세: 예상 매출 · PO 일정 · 예측 근거")
     pick = st.selectbox("품목 선택:", names, key="po_pick")
     render_po_detail(next(x for x in view if x["name"] == pick), base, sel, months, vat_incl, cfg)
+
+
+
+def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
+    """재고 부족으로 납품 못 할 PO(확정·예측)를 품목별로 집계: 얼마나, 언제부터, 신규 발주로 막을 수 있는지."""
+    st.divider()
+    st.subheader("⛔ 재고 부족으로 빠지는 매출 (품목별)")
+    if not cfg["cap"]:
+        st.info("사이드바에서 '재고 제약 반영'을 켜면 재고 부족으로 빠지는 매출을 볼 수 있습니다.")
+        return
+    sy, sm = sel
+    scope = st.radio("집계 범위", [f"{sy}년 {sm}월", f"예측 기간 전체 (~{horizon_end:%Y-%m})"], horizontal=True, key="loss_scope")
+    in_scope = (lambda d: (d.year, d.month) == sel) if scope.startswith(f"{sy}년") else (lambda d: d > base)
+    k = 1.0 if vat_incl else 1 / 1.1
+    rows = []
+    for f in view:
+        it = f["item"]
+        sh = [e for e in f["events"] if e["kind"] != "실적" and in_scope(e["date"]) and e["demand"] - e["deliv"] > 1e-9]
+        if not sh:
+            continue
+        lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] for e in es) * k
+        first = min(e["date"] for e in sh)
+        lt = it.lt if it else None
+        cut = base + timedelta(days=lt) if lt else None          # 오늘 공장 발주해도 이 날 전에는 입고 불가
+        unrec = [e for e in sh if cut is None or e["date"] < cut]
+        rec = [e for e in sh if cut is not None and e["date"] >= cut]
+        ev = deadlines.get(it.name) if it else None
+        inb = ", ".join(f"{d:%m/%d} {q:,.0f}" for d, q, _ in it.inbound) if it and it.inbound else "-"
+        rows.append({
+            "구분": it.cat if it else "미매칭", "품명(PO)": f["name"],
+            "빠지는 매출": int(lost(sh)), "빠지는 수량": int(sum(e["demand"] - e["deliv"] for e in sh)),
+            "미납 PO 건수": len(sh), "첫 미납일": first.strftime("%m/%d" if first.year == base.year else "%y/%m/%d"),
+            "평택 재고": int(it.main) if it else None, "발주완료 입고": inb,
+            "└ 리드타임 내(못 막음)": int(lost(unrec)), "└ 신규 발주로 회복 가능": int(lost(rec)),
+            "리드타임": lt,
+            "공장발주 데드라인": (ev["deadline"].strftime("%m/%d") if ev and ev["deadline"] else "-"),
+        })
+    if not rows:
+        st.success("이 범위에서는 재고 부족으로 빠지는 매출이 없습니다.")
+        return
+    df = pd.DataFrame(rows).sort_values("빠지는 매출", ascending=False).reset_index(drop=True)
+    t, u, r = df["빠지는 매출"].sum(), df["└ 리드타임 내(못 막음)"].sum(), df["└ 신규 발주로 회복 가능"].sum()
+    a, b, c = st.columns(3)
+    a.metric("빠지는 매출 합계", won(t), help=f"{len(df)}개 품목")
+    b.metric("리드타임 안이라 못 막는 금액", won(u), help="오늘 공장 발주해도 리드타임 전에는 입고가 안 되는 기간의 손실")
+    c.metric("지금 발주하면 회복 가능한 금액", won(r))
+
+    fig = go.Figure()
+    lab = [n if len(n) <= 24 else n[:23] + "…" for n in df["품명(PO)"]][::-1]
+    fig.add_trace(go.Bar(y=lab, x=list(df["└ 리드타임 내(못 막음)"])[::-1], orientation="h", name="리드타임 내(못 막음)",
+                         marker_color="#e76f51", hovertemplate="%{x:,.0f}원"))
+    fig.add_trace(go.Bar(y=lab, x=list(df["└ 신규 발주로 회복 가능"])[::-1], orientation="h", name="신규 발주로 회복 가능",
+                         marker_color="#f4a261", hovertemplate="%{x:,.0f}원"))
+    fig.update_layout(barmode="stack", height=max(260, 34 * len(df) + 80), margin=dict(l=20, r=20, t=20, b=20),
+                      xaxis_title=f"원 ({'VAT 포함' if vat_incl else 'VAT 제외'})", legend=dict(orientation="h", y=-0.15))
+    wide(st.plotly_chart, fig)
+
+    ccfg = {c_: num_col(c_) for c_ in ("빠지는 매출", "빠지는 수량", "평택 재고", "└ 리드타임 내(못 막음)", "└ 신규 발주로 회복 가능")}
+    if _HAS_SELECT:
+        event = wide(st.dataframe, df, hide_index=True, column_config=ccfg,
+                     on_select="rerun", selection_mode="single-row", key="loss_tbl")
+        rs = list(event.selection.rows) if event is not None and event.selection is not None else []
+        picked = str(df.iloc[rs[0]]["품명(PO)"]) if rs else None
+        if picked and picked != st.session_state.get("_last_loss_row"):
+            st.session_state["_last_loss_row"] = picked
+            st.session_state["po_pick"] = picked          # 아래 SKU 상세를 이 품목으로
+        elif not picked:
+            st.session_state["_last_loss_row"] = None
+    else:
+        wide(st.dataframe, df, hide_index=True, column_config=ccfg)
+    st.caption("빠지는 매출 = 확정·예측 PO 중 평택 재고(+발주완료 입고분)가 모자라 납품 못 할 수량 × 단가. "
+               "첫 미납일 = 재고가 처음 모자라는 PO 날짜. 리드타임 내 = 오늘 공장 발주해도 '기준일+리드타임' 전이라 막을 수 없는 손실, "
+               "그 이후 손실은 지금 발주하면 회복 가능. 공장발주 데드라인은 '재고·공장 발주' 탭 기준입니다. "
+               "행을 선택하면 아래 SKU 상세에서 PO별 미납 수량을 볼 수 있습니다.")
 
 
 def render_po_detail(f, base, sel, months, vat_incl, cfg):
@@ -1270,7 +1346,8 @@ def main():
 
     tab1, tab2 = st.tabs(["📦 재고 · 공장 발주", "🛒 쿠팡 PO 예측 · 월 매출"])
     with tab2:
-        render_po_tab(fcs, base, horizon_end, vat_incl, po_cfg)
+        render_po_tab(fcs, base, horizon_end, vat_incl, po_cfg,
+                      {it.name: calc[it.name][1] for it in items})
 
     with tab1:
         cats = ["전체 보기"] + sorted(df["구분"].unique())
