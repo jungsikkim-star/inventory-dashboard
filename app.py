@@ -387,9 +387,11 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
     pipe, events = [], []
     res = dict(first_po=None, stockout=None, short_days=[], n_po=0)
     main_s, vf_s, lost_s, lost = [], [], [], 0.0
+    out_s, prev_out = [], False
 
     for i in range(horizon):
         day = base + timedelta(days=i)
+        short_now = False
         q = inbound.get(day, 0.0)
         if q:
             main += q
@@ -414,6 +416,7 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
                 else:
                     lost += demand - main
                     main = 0.0
+                    short_now = True
                     res["short_days"].append(i)
                     if res["stockout"] is None:
                         res["stockout"] = i
@@ -449,58 +452,122 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
                 if vf + transit < trig and main <= 1e-9:
                     short_today = True
                 if short_today:
+                    short_now = True
                     res["short_days"].append(i)
                     if res["stockout"] is None:
                         res["stockout"] = i
                         if log:
                             events.append((day, "🚨 [평택 결품] 쿠팡 PO를 채울 재고 부족", main, vf))
+        # 밀크런은 평택이 0인 동안(출고 없는 날 포함) 계속 '결품 상태'로 본다
+        prev_out = short_now or (item.is_milkrun and prev_out and main <= 1e-9)
+        out_s.append(prev_out)
         main_s.append(main)
         vf_s.append(vf)
         lost_s.append(lost)
-    res.update(main=main_s, vf=vf_s, lost=lost_s, events=events)
+    res.update(main=main_s, vf=vf_s, lost=lost_s, out=out_s, events=events)
     return res
 
 
-def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: int, target_days: int) -> dict:
-    """시뮬레이션 결과 → 데드라인 / 상태 / 권장 발주량."""
-    ms, n = sim["main"], len(sim["main"])
-    safety_day = None
-    if safety > 0:                       # 지금 발주해도 lt일 뒤에야 도착 → lt일 이후 구간의 안전재고 이탈만 '발주로 막을 수 있음'
-        safety_day = next((i for i in range(min(lt, n), n) if ms[i] <= safety), None)
-    stock = sim["stockout"]
-    d_stock = None if stock is None else stock - lt
-    d_safe = None if safety_day is None else safety_day - lt
-    ds = [x for x in (d_stock, d_safe) if x is not None]
-    d_pol = min(ds) if ds else None
-    delayed = sum(1 for i in sim["short_days"] if i < lt)
+def _runs(flags):
+    """True 가 이어지는 구간들 → [(시작, 끝)]"""
+    runs, i, n = [], 0, len(flags)
+    while i < n:
+        if flags[i]:
+            j = i
+            while j + 1 < n and flags[j + 1]:
+                j += 1
+            runs.append((i, j))
+            i = j + 1
+        else:
+            i += 1
+    return runs
 
+
+def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: int, target_days: int) -> dict:
+    """
+    시뮬레이션 결과 → 데드라인 / 상태 / 권장 발주량.
+
+    핵심 원칙: 이미 발주한(발주완료) 입고분을 반영한 뒤에도 '끝까지 회복되지 않는' 부족만 신규 발주 대상으로 본다.
+      · 영구 부족  : 시뮬레이션 끝(HORIZON)까지 계속 안전재고 이하이거나 결품인 구간 → 신규 발주 데드라인 = 시작일 − 리드타임
+      · 일시 부족  : 이후 발주완료 입고분으로 회복되는 구간 → 신규 발주 대상이 아니라 '입고 전 부족'으로 따로 표시
+                     (단, 일시 결품이 리드타임 이후까지 이어지면 신규 발주로 단축 가능하므로 발주 대상에 포함)
+    """
+    ms, n = sim["main"], len(sim["main"])
+    out = sim.get("out") or [False] * n
     has_demand = adu > 0 or bool(item.plan)
+    pre = "입고 반영 후 " if item.inbound else ""
+    md = lambda i: fmt_md(base, i)
+
+    hard = _runs(out)
+    soft = _runs([m <= safety for m in ms]) if safety > 0 else []
+    pers_h = hard[-1] if hard and hard[-1][1] == n - 1 else None
+    pers_s = soft[-1] if soft and soft[-1][1] == n - 1 else None
+    trans_h = [r for r in hard if r != pers_h]
+    trans_s = [r for r in soft if r != pers_s]
+
+    cands = []                                   # (신규 발주 데드라인(일), 우선순위, 사유)
+    unavoid = pers_h if (pers_h and pers_h[0] < lt) else None
+    if pers_h:
+        cands.append((max(pers_h[0], lt) - lt, 0, f"{pre}{md(pers_h[0])} 결품"))
+    for a, b in trans_h:
+        if b >= lt:
+            cands.append((max(a, lt) - lt, 0, f"{md(a)} 결품"))
+    if pers_s:
+        a = pers_s[0]
+        cands.append((max(a, lt) - lt, 1, f"{pre}안전재고 회복 불가" if a == 0 else f"{pre}{md(a)} 안전재고 이탈"))
+    cands.sort()
+    d_pol = cands[0][0] if cands else None
+    reason = cands[0][2] if cands else ""
+
+    gap_txt = dip_txt = ""
+    if trans_h:
+        a0, b0 = trans_h[0]
+        tot = sum(b - a + 1 for a, b in trans_h)
+        gap_txt = (f"입고 전 결품 {tot}일 ({md(a0)}~{md(b0)}" + (f", {md(b0 + 1)} 입고" if b0 + 1 < n else "") + ")"
+                   + (f" 외 {len(trans_h) - 1}회" if len(trans_h) > 1 else ""))
+    elif trans_s:
+        a0, b0 = trans_s[0]
+        tot = sum(b - a + 1 for a, b in trans_s)
+        dip_txt = (f"입고 전 안전재고 이탈 {tot}일 ({md(a0)}~{md(b0)}" + (f", {md(b0 + 1)} 입고" if b0 + 1 < n else "") + ")")
+
     if not has_demand:
         tier, status = 5, "💤 출고없음"
-    elif d_stock is not None and d_stock < 0:
-        tier, status = 0, f"🚨 결품 예상 – 신규 발주로는 방지 불가 (평택 부족 {delayed}일)"
+    elif unavoid:
+        a = unavoid[0]
+        tier, status = 0, f"🚨 결품 불가피 {lt - a}일 ({md(a)}~{md(lt - 1)}) · 오늘 발주해도 신규분 입고({md(lt)}) 전 부족"
     elif d_pol is None:
         tier, status = 4, f"✅ 안정 ({n}일 내 이상 없음)"
     elif d_pol <= 0:
-        tier, status = 1, "🚨 오늘 발주"
+        tier, status = 1, f"🚨 오늘 발주 ({reason})"
     elif d_pol <= 7:
-        tier, status = 2, f"⚠️ 긴급 D-{d_pol}"
+        tier, status = 2, f"⚠️ 긴급 D-{d_pol} ({reason})"
     elif d_pol <= 14:
-        tier, status = 3, f"🔔 준비 D-{d_pol}"
+        tier, status = 3, f"🔔 준비 D-{d_pol} ({reason})"
     else:
         tier, status = 4, f"✅ 여유 D-{d_pol}"
 
-    # 권장 발주량: 신규 발주분이 도착하는 lt일 이후 target_days 동안
-    #   평택 재고가 기준선(안전재고, 없으면 0) 아래로 내려가거나 미충족 출고가 생기는 최대 부족분
+    if has_demand and not unavoid:
+        if gap_txt:
+            if tier >= 4 and trans_h[0][0] < lt:         # 신규 발주로는 못 막는 임박한 일시 결품 → 발주 대기가 아니라 입고/출고 일정 점검 대상
+                tier = 1.5
+                status = "🟠 " + gap_txt + ("" if d_pol is None else f" · 신규 발주는 D-{d_pol}")
+            else:
+                status += " · " + gap_txt
+        elif dip_txt and tier >= 4:
+            status += " · " + dip_txt
+
+    # 권장 발주량: 신규 발주분이 도착하는 시점부터 target_days 동안 평택 재고가 기준선(안전재고, 없으면 0) 아래로 내려가는 최대 부족분
     qty = 0.0
-    if has_demand and lt < n:
+    if has_demand and d_pol is not None and d_pol + lt < n:
+        A = d_pol + lt
         floor = safety if safety > 0 else 0.0
-        base_lost = sim["lost"][lt - 1] if lt >= 1 else 0.0
-        end = min(n, lt + target_days + 1)
-        qty = max(0.0, max(floor - ms[i] + (sim["lost"][i] - base_lost) for i in range(lt, end)))
+        base_lost = sim["lost"][A - 1] if A >= 1 else 0.0
+        end = min(n, A + target_days + 1)
+        qty = max(0.0, max(floor - ms[i] + (sim["lost"][i] - base_lost) for i in range(A, end)))
         if not item.moq_all and item.moq > 0:
             qty = math.ceil(qty / item.moq - 1e-9) * item.moq
-    return dict(tier=tier, status=status, d_pol=d_pol, d_stock=d_stock, safety_day=safety_day,
+    return dict(tier=tier, status=status, d_pol=d_pol, d_stock=None,
+                safety_day=(soft[0][0] if soft else None), reason=reason, gap=gap_txt, dip=dip_txt,
                 deadline=(base + timedelta(days=d_pol)) if d_pol is not None else None, rec_qty=int(round(qty)))
 
 
@@ -717,8 +784,9 @@ def main():
     else:
         wide(st.dataframe, show, hide_index=True)
         st.caption("표 클릭 선택은 Streamlit 1.35 이상에서 지원됩니다. 아래 드롭다운으로 품목을 고르세요.")
-    st.caption("발주 데드라인 = min(안전재고 이탈일, 평택 결품일) − 리드타임. 안전재고 이탈은 신규 발주분이 도착하는 리드타임 이후 구간만 봅니다. "
-               "권장 발주량은 도착 후 산정 기간 동안 안전재고(미기재 품목은 결품 방지) 기준 최대 부족분을 납품 MOQ 배수로 올림한 값입니다.")
+    st.caption("발주 데드라인 = (발주완료 입고분을 반영하고도 끝까지 회복되지 않는 안전재고 이탈일/결품일) − 리드타임. "
+               "발주완료 입고분으로 곧 회복되는 일시 부족은 데드라인에 쓰지 않고 상태 칸에 '입고 전 결품/안전재고 이탈'로 따로 표시합니다(🟠 = 신규 발주가 아니라 입고·출고 일정 점검 대상). "
+               "권장 발주량은 신규분이 도착한 뒤 산정 기간 동안 안전재고(미기재 품목은 결품 방지) 기준 최대 부족분을 납품 MOQ 배수로 올림한 값입니다.")
 
     # ── 개별 SKU 시뮬레이터
     st.divider()
@@ -750,8 +818,8 @@ def main():
 
     sim = simulate(it, base, p_adu, trig_mode, p_trig, p_mult, p_tr, log=True)
     ev = evaluate(it, sim, base, p_adu, p_safe, p_lt, target_days)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("발주상태", ev["status"])
+    st.markdown(f"**발주상태:** {ev['status']}")
+    m2, m3, m4 = st.columns(3)
     m2.metric("공장발주 데드라인", ev["deadline"].strftime("%Y-%m-%d") if ev["deadline"] else "-")
     m3.metric("평택 결품 예상일", fmt_md(base, sim["stockout"]))
     m4.metric("권장 발주량", f"{ev['rec_qty']:,}개" if p_adu > 0 else "-")
