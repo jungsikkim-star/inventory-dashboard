@@ -731,7 +731,8 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
 
     res = dict(name=name, item=item, price=price, Q=None, rate=0.0, r_po=r_po, r_sheet=None, rate_src="",
                gap=None, next=None, overdue=False, last=(past[-1][0] if past else None),
-               fut_last=(fut[-1][0] if fut else None), zero60=zero60, note="", events=[])
+               fut_last=(fut[-1][0] if fut else None), zero60=zero60, note="", events=[],
+               recs=recs, q_hist=[], consumed=None, start_stock=None)
 
     # 실적·확정 이벤트 (원래 행 단위, 단가는 행의 단가 우선)
     for x in recs:
@@ -746,7 +747,7 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
 
     q_hist = [q for _, q in (past or pos)][-cfg["q_n"]:]
     Q = float(statistics.median(q_hist))
-    res["Q"] = Q
+    res["Q"], res["q_hist"] = Q, q_hist
 
     use_sheet = cfg["mode"] == "sheet" and item is not None and not item.is_milkrun
     r_sheet = None
@@ -779,6 +780,7 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
     elif use_sheet and past:                        # 마지막 PO 이후 실제 출고가 Q를 채우는 시점
         last = past[-1][0]
         consumed = sum(item.sales.get(d, 0.0) for d in cfg["entered"] if last < d < base)
+        res["consumed"] = consumed
         raw = (Q - consumed * cfg["mult"]) / r
     else:
         raw = (past[-1][0] - base).days + gap
@@ -801,6 +803,7 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
     # 재고 제약: 평택 재고 + 발주완료 입고분 안에서만 납품 가능 (확정·예측 PO를 날짜순으로 차감)
     if cfg["cap"] and item is not None:
         stock = item.main
+        res["start_stock"] = stock
         inb = sorted((d, q) for d, q, _ in item.inbound)
         ii = 0
         for e in sorted((e for e in res["events"] if e["kind"] != "실적"), key=lambda e: (e["date"], e["kind"] == "예측")):
@@ -809,6 +812,7 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
                 ii += 1
             e["deliv"] = min(e["demand"], max(stock, 0.0))
             stock -= e["deliv"]
+            e["stock_after"] = stock
     res["events"].sort(key=lambda e: e["date"])
     return res
 
@@ -930,7 +934,23 @@ def render_po_tab(fcs, base, horizon_end, vat_incl, cfg):
     df = pd.DataFrame(rows).sort_values(["선택월 매출", "D-"], ascending=[False, True]).reset_index(drop=True)
     st.subheader(f"📋 품목별 차기 PO & {sm}월 예상 매출")
     money = ["단가", "선택월 매출", "└ 실적", "└ 확정", "└ 예측", "재고부족 차감", "전년 동월 매출"]
-    wide(st.dataframe, df, hide_index=True, column_config={c: num_col(c) for c in money + ["선택월 수량", "PO 1회 수량"]})
+    names = list(df["품명(PO)"])
+    if st.session_state.get("po_pick") not in names:      # 필터 변경으로 선택값이 목록에서 빠지면 첫 품목으로
+        st.session_state["po_pick"] = names[0]
+    ccfg = {c: num_col(c) for c in money + ["선택월 수량", "PO 1회 수량"]}
+    if _HAS_SELECT:
+        event = wide(st.dataframe, df, hide_index=True, column_config=ccfg,
+                     on_select="rerun", selection_mode="single-row", key="po_tbl")
+        rows_sel = list(event.selection.rows) if event is not None and event.selection is not None else []
+        picked = str(df.iloc[rows_sel[0]]["품명(PO)"]) if rows_sel else None
+        if picked and picked != st.session_state.get("_last_po_row"):
+            st.session_state["_last_po_row"] = picked          # 표에서 새로 고른 행만 아래 상세 선택값을 덮어씀
+            st.session_state["po_pick"] = picked
+        elif not picked:
+            st.session_state["_last_po_row"] = None
+        st.caption(f"👆 행 왼쪽 선택 칸을 클릭하면 아래 'SKU 상세'가 그 품목으로 바뀝니다.  현재 선택: **{st.session_state['po_pick']}**")
+    else:
+        wide(st.dataframe, df, hide_index=True, column_config=ccfg)
     st.caption("차기 PO 예상: VF형은 마지막 PO 이후 실제 출고 누적이 'PO 1회 수량'을 채우는 날, 밀크런은 마지막(확정 포함) PO + PO 간격. "
                "⏰지연 = 예상일이 이미 지났는데 PO가 없음 (재고 부족·쿠팡 발주 보류 등 확인 필요). "
                "재고부족 차감 = 수요상 PO는 들어오지만 평택 재고가 모자라 납품 못 할 것으로 보는 금액."
@@ -961,33 +981,124 @@ def render_po_tab(fcs, base, horizon_end, vat_incl, cfg):
                       margin=dict(l=20, r=20, t=30, b=20), legend=dict(orientation="h", y=-0.15))
     wide(st.plotly_chart, fig)
 
-    # ── 품목별 PO 타임라인
-    st.subheader("🔍 품목별 PO 타임라인")
-    names = list(df["품명(PO)"])
-    if st.session_state.get("po_pick") not in names:      # 필터 변경으로 선택값이 목록에서 빠지면 첫 품목으로
-        st.session_state["po_pick"] = names[0]
+    # ── SKU 상세
+    st.divider()
+    st.subheader("🔍 SKU 상세: 예상 매출 · PO 일정 · 예측 근거")
     pick = st.selectbox("품목 선택:", names, key="po_pick")
-    f = next(x for x in view if x["name"] == pick)
-    lo = base - timedelta(days=90)
-    evs = [e for e in f["events"] if e["date"] >= lo]
-    fig2 = go.Figure()
-    for k, col in (("실적", "#1f4e79"), ("확정", "#2a9d8f"), ("예측", "#9ecae1")):
-        es = [e for e in evs if e["kind"] == k]
-        if es:
-            fig2.add_trace(go.Bar(x=[e["date"] for e in es], y=[e["deliv"] for e in es], name=k, marker_color=col))
-    short = [e for e in evs if e["demand"] - e["deliv"] > 1e-9]
-    if short:
-        fig2.add_trace(go.Bar(x=[e["date"] for e in short], y=[e["demand"] - e["deliv"] for e in short],
-                              name="재고 부족(미납 예상)", marker_color="#e76f51", opacity=0.6))
-    fig2.add_vline(x=base.isoformat(), line_dash="dash", line_color="#999")
-    fig2.update_layout(barmode="stack", yaxis_title="PO 수량", margin=dict(l=20, r=20, t=30, b=20),
-                       legend=dict(orientation="h", y=-0.15))
-    wide(st.plotly_chart, fig2)
+    render_po_detail(next(x for x in view if x["name"] == pick), base, sel, months, vat_incl, cfg)
+
+
+def render_po_detail(f, base, sel, months, vat_incl, cfg):
     it = f["item"]
-    st.caption(f"PO 1회 {f['Q'] or 0:,.0f}개 · 일 출고율 {f['rate']:,.1f}개 ({f['rate_src'] or f['note']}) · "
-               f"참고: PO 실적 기준 {f['r_po']:,.1f}개/일"
-               + (f", 시트 출고 기준 {f['r_sheet']:,.1f}개/일" if f["r_sheet"] is not None else "")
-               + (f" · 매칭 품목: {it.name} (평택 {it.main:,.0f}개)" if it else " · 재고시트 매칭 없음 → 재고 제약 미적용"))
+    sy, sm = sel
+    mk = lambda d: (d.year, d.month)
+    rev = lambda es, d=False: sum(ev_rev(e, vat_incl, d) for e in es)
+    ev = [e for e in f["events"] if mk(e["date"]) == sel]
+    part = lambda k: [e for e in ev if e["kind"] == k]
+    ly_rev = rev([e for e in f["events"] if e["kind"] == "실적" and mk(e["date"]) == (sy - 1, sm)])
+    total = rev(ev)
+    nxt = f["next"]
+
+    st.markdown(f"**{f['name']}** · "
+                + (f"{it.cat} / {'밀크런' if it.is_milkrun else 'VF형'} · 재고시트: {it.name}" if it else "재고시트 매칭 없음")
+                + f" · 단가 {f['price']:,.0f}원")
+    a, b, c, d, e5 = st.columns(5)
+    a.metric(f"{sm}월 예상 매출", won(total),
+             delta=(f"전년 동월 대비 {(total / ly_rev - 1) * 100:+.0f}%" if ly_rev > 0 else None))
+    b.metric("실적 / 확정", f"{won(rev(part('실적')))} / {won(rev(part('확정')))}")
+    c.metric("예측", won(rev(part("예측"))), help=f"예측 PO {len(part('예측'))}건")
+    d.metric("재고 부족 차감", won(rev(ev, True) - total))
+    e5.metric("차기 PO 예상", (nxt.strftime("%m/%d") + (" ⏰" if f["overdue"] else "")) if nxt else "-",
+              delta=(f"D-{(nxt - base).days}" if nxt else None), delta_color="off")
+
+    # 예측 근거
+    lines = []
+    if f["Q"]:
+        lines.append(f"PO 1회 수량 **{f['Q']:,.0f}개** = 최근 {len(f['q_hist'])}회 PO 수량 "
+                     f"({', '.join(f'{q:,.0f}' for q in f['q_hist'])})의 중앙값")
+    if f["rate"]:
+        lines.append(f"일 출고율 **{f['rate']:,.1f}개/일** ({f['rate_src']}"
+                     + (f", 수요 보정 {cfg['mult'] * 100:.0f}% 적용" if cfg["mult"] != 1 else "") + ")"
+                     + f" · 참고: PO 실적 {f['r_po']:,.1f}개/일"
+                     + (f", 시트 출고 {f['r_sheet']:,.1f}개/일" if f["r_sheet"] is not None else ""))
+    if f["gap"]:
+        lines.append(f"PO 간격 **{f['gap']:,.1f}일** = {f['Q']:,.0f} ÷ {f['rate']:,.1f}")
+    if f["fut_last"]:
+        lines.append(f"엑셀에 이미 잡힌 확정 PO가 {f['fut_last']:%m/%d}까지 있어 그 다음부터 예측")
+    elif f["consumed"] is not None and f["last"]:
+        lines.append(f"마지막 PO {f['last']:%m/%d} 이후 시트 출고 누적 **{f['consumed']:,.0f}개** / PO 1회 {f['Q']:,.0f}개"
+                     + (" → 이미 채워졌는데 PO가 없어 ⏰지연" if f["overdue"] else " → 남은 만큼 출고되는 날을 차기 PO로"))
+    elif f["last"] and f["gap"]:
+        lines.append(f"마지막 PO {f['last']:%m/%d} + 간격 {f['gap']:,.1f}일")
+    if it is not None and cfg["cap"]:
+        inb = [(dd, q) for dd, q, _ in it.inbound]
+        lines.append(f"납품 가능 재고: 평택 {it.main:,.0f}개"
+                     + (" + 발주완료 입고 " + ", ".join(f"{dd:%m/%d} {q:,.0f}개" for dd, q in inb) if inb else " (발주완료 입고 예정 없음)"))
+    elif it is None:
+        lines.append("재고시트와 매칭되지 않아 재고 제약 없이 PO 실적만으로 계산")
+    if f["note"]:
+        lines.append(f"⚠️ {f['note']}")
+    if f["zero60"]:
+        lines.append(f"최근 60일 0개 납품 PO {f['zero60']}건 (재고 부족 등으로 못 받은 PO)")
+    st.markdown("\n".join(f"- {x}" for x in lines))
+
+    g1, g2 = st.columns(2)
+    with g1:   # PO 타임라인 (최근 90일 ~ 예측 범위)
+        lo = base - timedelta(days=90)
+        evs = [e for e in f["events"] if e["date"] >= lo]
+        fig2 = go.Figure()
+        for k, col in (("실적", "#1f4e79"), ("확정", "#2a9d8f"), ("예측", "#9ecae1")):
+            es = [e for e in evs if e["kind"] == k]
+            if es:
+                fig2.add_trace(go.Bar(x=[e["date"] for e in es], y=[e["deliv"] for e in es], name=k, marker_color=col))
+        short = [e for e in evs if e["demand"] - e["deliv"] > 1e-9]
+        if short:
+            fig2.add_trace(go.Bar(x=[e["date"] for e in short], y=[e["demand"] - e["deliv"] for e in short],
+                                  name="재고 부족(미납 예상)", marker_color="#e76f51", opacity=0.6))
+        fig2.add_vline(x=base.isoformat(), line_dash="dash", line_color="#999")
+        fig2.update_layout(title="PO 타임라인 (수량)", barmode="stack", margin=dict(l=20, r=20, t=40, b=20),
+                           legend=dict(orientation="h", y=-0.2))
+        wide(st.plotly_chart, fig2)
+    with g2:   # 이 SKU의 월별 매출
+        y0, m0 = add_months(base.year, base.month, -12)
+        cm = [mm for mm in months if mm >= (y0, m0)]
+        labels = [f"{a_ % 100:02d}.{b_:02d}" for a_, b_ in cm]
+        fig3 = go.Figure()
+        for k, col in (("실적", "#1f4e79"), ("확정", "#2a9d8f"), ("예측", "#9ecae1")):
+            fig3.add_trace(go.Bar(x=labels, marker_color=col, name=k, hovertemplate="%{y:,.0f}원",
+                                  y=[rev([e for e in f["events"] if e["kind"] == k and mk(e["date"]) == mm]) for mm in cm]))
+        fig3.add_trace(go.Scatter(x=labels, name="전년 동월", mode="lines+markers", line=dict(color="#888", dash="dot"),
+                                  hovertemplate="%{y:,.0f}원",
+                                  y=[rev([e for e in f["events"] if e["kind"] == "실적" and mk(e["date"]) == (mm[0] - 1, mm[1])]) for mm in cm]))
+        fig3.update_layout(title="월별 매출", barmode="stack", hovermode="x unified", margin=dict(l=20, r=20, t=40, b=20),
+                           legend=dict(orientation="h", y=-0.2))
+        wide(st.plotly_chart, fig3)
+
+    # 선택월 PO 일정
+    st.markdown(f"**{sy}년 {sm}월 PO 일정**")
+    if ev:
+        wd = "월화수목금토일"
+        tbl = pd.DataFrame([{
+            "일자": e["date"].strftime("%m/%d") + f"({wd[e['date'].weekday()]})", "구분": e["kind"],
+            "PO 수량": int(e["demand"]), "납품(예상)": int(e["deliv"]), "단가": int(e["price"]),
+            "매출": int(ev_rev(e, vat_incl)),
+            "평택 잔여": int(e["stock_after"]) if "stock_after" in e else None,
+            "비고": ("재고 부족 " + f"{e['demand'] - e['deliv']:,.0f}개 미납" if e["demand"] - e["deliv"] > 1e-9 else ""),
+        } for e in ev])
+        wide(st.dataframe, tbl, hide_index=True,
+             column_config={k: num_col(k) for k in ("PO 수량", "납품(예상)", "단가", "매출", "평택 잔여")})
+    else:
+        st.write("이 달에는 실적·확정·예측 PO가 없습니다.")
+
+    with st.expander("📜 PO 원본 이력 (최근 60건, 0개 납품 포함)"):
+        wd = "월화수목금토일"
+        hist = [x for x in f["recs"]][-60:][::-1]
+        wide(st.dataframe, pd.DataFrame([{
+            "일자": x["date"].strftime("%Y-%m-%d") + f"({wd[x['date'].weekday()]})", "수량": int(x["qty"]),
+            "단가": int(x["price"]), "매출": int(x["qty"] * x["price"] * (1 if vat_incl else 1 / 1.1)),
+            "센터": x["center"], "상태": "확정(미래)" if x["date"] > base else ("0개 납품" if x["qty"] <= 0 else "")}
+            for x in hist]), hide_index=True,
+             column_config={k: num_col(k) for k in ("수량", "단가", "매출")})
 
 
 def main():
