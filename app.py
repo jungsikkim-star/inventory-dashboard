@@ -54,6 +54,8 @@ DEFAULT_MOQ = 100      # MOQ 미기재 시 임시값
 PERIOD_DAY = {"초": 10, "중": 20, "말": None}   # '11월초/12월 중순/9월말' → 보수적으로 순의 끝날, 말=말일
 FORECAST_MONTHS = 6    # PO/매출 예측 범위: 기준월 포함 6개월
 NO_MATCH = "(매칭 안 함)"
+# 쿠팡 PO 데이터에는 없지만 목표는 관리하는 상품군 (목표 표 맨 위에 표시, '기타매출' 시트 기본 상품군)
+EXTRA_TARGET_GROUPS = ["네이버 두부모래"]
 
 
 # ─────────────────────────────── 공통 유틸 ───────────────────────────────
@@ -369,7 +371,34 @@ def parse_target_sheet(raw: pd.DataFrame, ref_year: int) -> dict:
     return out
 
 
-PARSER_VERSION = 5     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
+    """'기타매출' 시트: [날짜 | 상품군 | 매출금액 | (메모)]. 날짜 대신 '2026-10' 같은 월만 적으면 그 달 1일로 봅니다."""
+    n = raw.shape[0]
+    hr = next((r for r in range(min(10, n))
+               if any("매출" in clean_txt(x) or "금액" in clean_txt(x) for x in raw.iloc[r].tolist())
+               and any(clean_txt(x) in ("날짜", "일자", "월", "기간") for x in raw.iloc[r].tolist())), None)
+    if hr is None:
+        raise ValueError("기타매출 시트에서 '날짜'와 '매출금액' 헤더를 찾지 못했습니다.")
+    hdr = [clean_txt(x) for x in raw.iloc[hr].tolist()]
+    c_d = next(i for i, h in enumerate(hdr) if h in ("날짜", "일자", "월", "기간"))
+    c_a = next(i for i, h in enumerate(hdr) if "매출" in h or "금액" in h)
+    c_g = next((i for i, h in enumerate(hdr) if h in ("상품군", "품명", "채널", "구분")), None)
+    out = []
+    for r in range(hr + 1, n):
+        v = raw.iat[r, c_d]
+        d = to_date(v)
+        if d is None:
+            ym = parse_month_label(v, ref_year)
+            d = date(ym[0], ym[1], 1) if ym else None
+        amt = to_num(raw.iat[r, c_a])
+        if d is None or not amt:
+            continue
+        g = raw.iat[r, c_g] if c_g is not None else None
+        out.append(dict(date=d, amount=amt, group=str(g).strip() if clean_txt(g) else EXTRA_TARGET_GROUPS[0]))
+    return out
+
+
+PARSER_VERSION = 6     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -377,11 +406,13 @@ def load_workbook(file_bytes: bytes, parser_version: int = PARSER_VERSION) -> di
     """월별 재고 시트와 쿠팡 PO 이력 시트를 나눠 읽는다. 형식이 맞지 않는 시트는 건너뛰고 이유를 남긴다."""
     import io
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
-    sheets, po, skipped, targets = [], [], [], {}
+    sheets, po, skipped, targets, manual = [], [], [], {}, []
     for s in xl.sheet_names:
         raw = xl.parse(s, header=None)
         try:
-            if "목표" in s:
+            if "기타매출" in s or "매출입력" in s:
+                manual += parse_manual_sales(raw, today_kst().year)
+            elif "목표" in s:
                 targets.update(parse_target_sheet(raw, today_kst().year))
             elif is_po_sheet(raw):
                 po.append(parse_po_sheet(raw, s))
@@ -389,7 +420,7 @@ def load_workbook(file_bytes: bytes, parser_version: int = PARSER_VERSION) -> di
                 sheets.append(parse_sheet(raw, s, today_kst().year))
         except Exception as e:          # 메모 탭 등 형식이 다른 시트 때문에 전체가 멈추지 않도록
             skipped.append(f"{s}: {e}")
-    return dict(sheets=sheets, po=po, skipped=skipped, targets=targets)
+    return dict(sheets=sheets, po=po, skipped=skipped, targets=targets, manual=manual)
 
 
 def as_date(v):
@@ -870,6 +901,25 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
     return res
 
 
+def manual_entries(rows, base) -> list:
+    """'기타매출' 시트의 금액을 상품군별 가상 품목으로 만든다 (수량=금액, 단가=1). 예측은 하지 않는다."""
+    by = {}
+    for r in rows:
+        by.setdefault(r["group"], []).append(r)
+    out = []
+    for g, rs in by.items():
+        rs = sorted(rs, key=lambda x: x["date"])
+        past = [x["date"] for x in rs if x["date"] <= base]
+        out.append(dict(
+            name=f"{g} (직접입력)", item=None, price=0.0, Q=None, rate=0.0, r_po=0.0, r_sheet=None, rate_src="",
+            gap=None, next=None, overdue=False, last=(past[-1] if past else None), fut_last=None, zero60=0,
+            note="'기타매출' 시트 직접 입력 (예측 없음)", q_hist=[], consumed=None, start_stock=None, group=g, manual=True,
+            recs=[dict(date=x["date"], name=g, qty=x["amount"], price=1.0, center="직접입력") for x in rs],
+            events=[dict(date=x["date"], kind="실적" if x["date"] <= base else "확정",
+                         demand=x["amount"], deliv=x["amount"], price=1.0) for x in rs]))
+    return out
+
+
 def forecast_all(po_recs, items, mapping, base, end, cfg):
     by_name = {}
     for r in po_recs:
@@ -1000,10 +1050,6 @@ def date_col(label):
 # ─────────────────────────────── 상품군 · 목표 ───────────────────────────────
 DEFAULT_GROUP_RULES = [("기저귀", "반려견 기저귀"), ("장작", "장작"), ("필름", "보호필름"), ("필터", "차량용 필터"),
                        ("냄비", "주방(냄비·팬)"), ("팬", "주방(냄비·팬)"), ("웍", "주방(냄비·팬)")]
-
-
-# 쿠팡 PO 데이터에는 없지만 목표는 관리하는 상품군 (목표 표 맨 위에 표시)
-EXTRA_TARGET_GROUPS = ["네이버 두부모래"]
 
 
 def group_of(name: str, rules) -> str:
@@ -1213,34 +1259,67 @@ def group_rows(view, sel, ctx, with_targets=True):
                      "전년 동월": int(lyv), "전년비(%)": round((tot / lyv - 1) * 100) if lyv else None,
                      "재고부족 손실": int(dem - tot), "SKU": len(fs)})
     df = pd.DataFrame(rows)
-    df["데이터"] = ["" if n else "쿠팡PO 데이터 없음" for n in df["SKU"]]
+    df["데이터"] = ["" if n else "매출 데이터 없음 ('기타매출' 시트에 입력)" for n in df["SKU"]]
     return df.sort_values(["예상 매출", "목표"], ascending=False, na_position="last").reset_index(drop=True)
 
 
+def won_s(v) -> str:
+    """표 안에 넣을 짧은 금액 문자열 (값이 없으면 '-')."""
+    if v is None or (isinstance(v, float) and math.isnan(v)) or abs(v) < 0.5:
+        return "-"
+    if abs(v) >= 1e8:
+        return f"{v / 1e8:,.2f}억"
+    return f"{v / 1e4:,.0f}만"
+
+
+def pct_s(v, sign=False) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "-"
+    return f"{v:+.0f}%" if sign else f"{v:.0f}%"
+
+
 def render_group_section(view, sel, ctx, with_targets=True):
-    sec(f"📦 상품군별 {sel[1]}월 매출", "상품군 기준은 '데이터 설정' 탭에서 바꿀 수 있습니다.")
+    sec(f"📦 상품군별 {sel[1]}월 매출", "확보 = 실적 + 확정 · 상품군 기준은 '데이터 설정' 탭에서 바꿀 수 있습니다.")
     df = group_rows(view, sel, ctx, with_targets)
-    left, right = st.columns([3, 2])
-    with left:
-        money = ["예상 매출", "실적", "확정", "예측", "목표", "전월", "전년 동월", "재고부족 손실"]
-        ccfg = {c: num_col(c) for c in money}
-        ccfg.update({"달성률(예상)": pct_col("달성률(예상)"), "확보율": pct_col("확보율"),
-                     "전월비(%)": st.column_config.NumberColumn("전월비", format="%+d%%"),
-                     "전년비(%)": st.column_config.NumberColumn("전년비", format="%+d%%")})
-        wide(st.dataframe, df, hide_index=True, column_config=ccfg)
-    with right:
-        fig = go.Figure()
-        y = list(df["상품군"])[::-1]
-        for k in ("실적", "확정", "예측"):
-            fig.add_trace(go.Bar(y=y, x=list(df[k])[::-1], orientation="h", name=k,
-                                 marker_color=C[{"실적": "act", "확정": "conf", "예측": "pred"}[k]],
-                                 hovertemplate="%{x:,.0f}원"))
-        if df["목표"].notna().any():
-            fig.add_trace(go.Scatter(y=y, x=list(df["목표"])[::-1], mode="markers", name="목표",
-                                     marker=dict(symbol="line-ns-open", size=22, color="#222", line=dict(width=3)),
-                                     hovertemplate="목표 %{x:,.0f}원"))
-        fig.update_layout(barmode="stack")
-        wide(st.plotly_chart, style_fig(fig, height=max(220, 48 * len(df) + 90)))
+    nz = lambda v: None if v is None or (isinstance(v, float) and math.isnan(v)) else v
+    show = pd.DataFrame({
+        "상품군": df["상품군"],
+        "예상 매출": df["예상 매출"].map(won_s),
+        "목표": df["목표"].map(lambda v: won_s(nz(v))),
+        "달성률": df["달성률(예상)"],
+        "확보 매출": (df["실적"] + df["확정"]).map(won_s),
+        "확보율": df["확보율"],
+        "실적": df["실적"].map(won_s), "확정": df["확정"].map(won_s), "예측": df["예측"].map(won_s),
+        "전월": df["전월"].map(won_s), "전월비": df["전월비(%)"].map(lambda v: pct_s(nz(v), True)),
+        "전년 동월": df["전년 동월"].map(won_s), "전년비": df["전년비(%)"].map(lambda v: pct_s(nz(v), True)),
+        "재고부족 손실": df["재고부족 손실"].map(lambda v: won_s(v) if v else "-"),
+        "SKU": df["SKU"], "비고": df["데이터"],
+    })
+    ccfg = {"달성률": pct_col("달성률"), "확보율": pct_col("확보율")}
+    try:
+        ccfg["상품군"] = st.column_config.TextColumn("상품군", pinned=True)
+    except TypeError:
+        pass
+    wide(st.dataframe, show, hide_index=True, column_config=ccfg)
+
+    tot = df["실적"] + df["확정"] + df["예측"]
+    tgt = df["목표"].map(nz)
+    fig = go.Figure()
+    y = list(df["상품군"])[::-1]
+    for k in ("실적", "확정", "예측"):
+        fig.add_trace(go.Bar(y=y, x=list(df[k])[::-1], orientation="h", name=k,
+                             marker_color=C[{"실적": "act", "확정": "conf", "예측": "pred"}[k]],
+                             hovertemplate=k + " %{x:,.0f}원<extra></extra>"))
+    if tgt.notna().any():
+        fig.add_trace(go.Scatter(y=y, x=list(tgt)[::-1], mode="markers", name="목표",
+                                 marker=dict(symbol="line-ns-open", size=22, color="#222", line=dict(width=3)),
+                                 hovertemplate="목표 %{x:,.0f}원<extra></extra>"))
+    labels = [won_s(t) + (f" / 목표 {won_s(g)} ({t / g:.0%})" if g else "") for t, g in zip(tot, tgt)]
+    xs = [max(t, g or 0) for t, g in zip(tot, tgt)]
+    fig.add_trace(go.Scatter(y=y, x=xs[::-1], mode="text", text=labels[::-1], textposition="middle right",
+                             textfont=dict(size=12), showlegend=False, hoverinfo="skip"))
+    fig.update_layout(barmode="stack", xaxis=dict(range=[0, max(xs + [1]) * 1.45]))
+    wide(st.plotly_chart, style_fig(fig, height=max(220, 44 * len(df) + 90)))
 
 
 def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
@@ -1323,6 +1402,13 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
 
 
 def render_po_detail(f, base, sel, months, vat_incl, cfg):
+    if f.get("manual"):
+        ev = [e for e in f["events"] if (e["date"].year, e["date"].month) == sel]
+        st.markdown(f"**{f['name']}** · 엑셀 '기타매출' 시트에 직접 입력한 매출 (쿠팡 PO 아님, 예측 없음)")
+        st.metric(f"{sel[1]}월 매출", won(sum(ev_rev(e, vat_incl) for e in ev)))
+        wide(st.dataframe, pd.DataFrame([{"일자": x["date"], "매출": int(ev_rev(x, vat_incl))} for x in f["events"]][::-1]),
+             hide_index=True, column_config={"일자": date_col("일자"), "매출": num_col("매출")})
+        return
     it = f["item"]
     sy, sm = sel
     mk = lambda d: (d.year, d.month)
@@ -1677,6 +1763,8 @@ def render_home(ctx):
             sec("🛒 쿠팡 PO 일정", "지연 PO + 앞으로 7일")
             rows = [{"일자": f["next"], "품명": f["name"], "구분": "⏰ 지연", "예상 금액": None} for f in fcs if f["overdue"]]
             for f in fcs:
+                if f.get("manual"):
+                    continue
                 for e in f["events"]:
                     if base < e["date"] <= base + timedelta(days=7) and e["kind"] != "실적":
                         rows.append({"일자": e["date"], "품명": f["name"], "구분": e["kind"],
@@ -1922,6 +2010,20 @@ def build_report(ctx) -> bytes:
     return buf.getvalue()
 
 
+def manual_template() -> bytes:
+    import io
+    df = pd.DataFrame([{"날짜": today_kst(), "상품군": EXTRA_TARGET_GROUPS[0], "매출금액": 1000000, "메모": "예시 행 (지우고 쓰세요)"}])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="기타매출", index=False)
+        ws = xw.sheets["기타매출"]
+        for col, w in zip("ABCD", (14, 18, 14, 24)):
+            ws.column_dimensions[col].width = w
+        ws["A2"].number_format = "yyyy-mm-dd"
+        ws["C2"].number_format = "#,##0"
+    return buf.getvalue()
+
+
 def target_template(groups, months) -> bytes:
     import io
     df = pd.DataFrame({"상품군": ["전체"] + list(groups), **{f"{y}-{m:02d}": [None] * (len(groups) + 1) for y, m in months}})
@@ -1981,6 +2083,10 @@ def build_notes(ctx):
     no_po = sorted({i.name for i in items} - set(mapping.values()))
     if po_names and no_po:
         notes.append(f"PO 이력이 없는 재고시트 품목 {len(no_po)}개는 매출 예측에서 빠집니다: {', '.join(no_po)}")
+    if wb.get("manual"):
+        m = wb["manual"]
+        notes.append(f"엑셀 '기타매출' 시트에서 {len(m)}행, 합계 {won(sum(x['amount'] for x in m))}을 읽었습니다 "
+                     f"(상품군: {', '.join(sorted({x['group'] for x in m}))}).")
     if wb.get("targets"):
         notes.append(f"엑셀 '목표' 시트에서 {len(wb['targets'])}개월 목표를 읽었습니다.")
     return notes
@@ -2132,6 +2238,7 @@ def main():
     fcs = forecast_all(po_recs, items, mapping, base, horizon_end, po_cfg) if po_recs else []
     for f in fcs:
         f["group"] = group_of(f["name"], rules)
+    fcs += manual_entries(wb.get("manual", []), base)
     item_group = {i.name: group_of(i.name, rules) for i in items}
     groups = sorted(set(item_group.values()) | {f["group"] for f in fcs})
 
@@ -2148,6 +2255,12 @@ def main():
                                column_config={f"{y}-{m:02d}": st.column_config.NumberColumn(f"{y}-{m:02d}", min_value=0, format="%d")
                                               for y, m in tmonths})
         st.download_button("⬇️ 목표 시트 템플릿 (.xlsx)", target_template(list(dict.fromkeys(EXTRA_TARGET_GROUPS + groups)), tmonths), file_name="목표_템플릿.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.divider()
+        sec("🧾 쿠팡 외 매출 직접 입력 ('기타매출' 시트)",
+            "네이버 두부모래처럼 쿠팡 PO가 아닌 매출은 마스터 엑셀에 '기타매출' 시트를 만들어 [날짜 | 상품군 | 매출금액]만 적으면 "
+            "실적으로 합산됩니다. 금액은 VAT 포함, 날짜 대신 '2026-10'처럼 월만 적어도 됩니다. 상품군을 비우면 '네이버 두부모래'로 봅니다.")
+        st.download_button("⬇️ 기타매출 시트 템플릿 (.xlsx)", manual_template(), file_name="기타매출_템플릿.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     targets = {}
     for (y, m) in tmonths:
