@@ -1002,6 +1002,10 @@ DEFAULT_GROUP_RULES = [("기저귀", "반려견 기저귀"), ("장작", "장작"
                        ("냄비", "주방(냄비·팬)"), ("팬", "주방(냄비·팬)"), ("웍", "주방(냄비·팬)")]
 
 
+# 쿠팡 PO 데이터에는 없지만 목표는 관리하는 상품군 (목표 표 맨 위에 표시)
+EXTRA_TARGET_GROUPS = ["네이버 두부모래"]
+
+
 def group_of(name: str, rules) -> str:
     k = clean_txt(name)
     for kw, g in rules:
@@ -1090,7 +1094,7 @@ def render_po_tab(ctx):
                + ("" if cfg["cap"] else " · 재고 제약 미반영(수요 기준)"))
 
     st.divider()
-    render_group_section(view, sel, ctx)
+    render_group_section(view, sel, ctx, with_targets=not sel_g and not sel_c)
 
     # ── 품목별 표
     st.divider()
@@ -1188,11 +1192,14 @@ def render_po_tab(ctx):
         render_po_detail(next(x for x in view if x["name"] == pick), base, sel, months, vat_incl, cfg)
 
 
-def group_rows(view, sel, ctx):
+def group_rows(view, sel, ctx, with_targets=True):
     vat = ctx["vat_incl"]
     prev, ly = add_months(sel[0], sel[1], -1), (sel[0] - 1, sel[1])
     rows = []
-    for g in sorted({f["group"] for f in view}):
+    gs = {f["group"] for f in view}
+    if with_targets:      # 매출 데이터는 없어도 목표가 있는 상품군(예: 네이버 두부모래)도 표에 보이게
+        gs |= {g for g, v in ctx["targets"].get(sel, {}).items() if g != "전체" and v}
+    for g in sorted(gs):
         fs = [f for f in view if f["group"] == g]
         a, c, p = (month_tot(fs, sel, vat, k) for k in ("실적", "확정", "예측"))
         tot = a + c + p
@@ -1205,12 +1212,14 @@ def group_rows(view, sel, ctx):
                      "전월": int(pv), "전월비(%)": round((tot / pv - 1) * 100) if pv else None,
                      "전년 동월": int(lyv), "전년비(%)": round((tot / lyv - 1) * 100) if lyv else None,
                      "재고부족 손실": int(dem - tot), "SKU": len(fs)})
-    return pd.DataFrame(rows).sort_values("예상 매출", ascending=False).reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    df["데이터"] = ["" if n else "쿠팡PO 데이터 없음" for n in df["SKU"]]
+    return df.sort_values(["예상 매출", "목표"], ascending=False, na_position="last").reset_index(drop=True)
 
 
-def render_group_section(view, sel, ctx):
+def render_group_section(view, sel, ctx, with_targets=True):
     sec(f"📦 상품군별 {sel[1]}월 매출", "상품군 기준은 '데이터 설정' 탭에서 바꿀 수 있습니다.")
-    df = group_rows(view, sel, ctx)
+    df = group_rows(view, sel, ctx, with_targets)
     left, right = st.columns([3, 2])
     with left:
         money = ["예상 매출", "실적", "확정", "예측", "목표", "전월", "전년 동월", "재고부족 손실"]
@@ -2133,11 +2142,12 @@ def main():
             "마스터 엑셀에 '목표' 시트로 넣어 두세요 (다음 업로드부터 자동으로 채워짐).")
         xt = wb.get("targets", {})
         tdf = pd.DataFrame([{"상품군": g, **{f"{y}-{m:02d}": (xt.get((y, m), {}).get(g)) for y, m in tmonths}}
-                            for g in ["전체"] + groups])
+                            for g in ["전체"] + list(dict.fromkeys(EXTRA_TARGET_GROUPS + groups
+                                                                     + sorted({g_ for d in xt.values() for g_ in d} - {"전체"})))])
         tedit = st.data_editor(tdf, hide_index=True, key=f"targets_{sig}", disabled=["상품군"],
                                column_config={f"{y}-{m:02d}": st.column_config.NumberColumn(f"{y}-{m:02d}", min_value=0, format="%d")
                                               for y, m in tmonths})
-        st.download_button("⬇️ 목표 시트 템플릿 (.xlsx)", target_template(groups, tmonths), file_name="목표_템플릿.xlsx",
+        st.download_button("⬇️ 목표 시트 템플릿 (.xlsx)", target_template(list(dict.fromkeys(EXTRA_TARGET_GROUPS + groups)), tmonths), file_name="목표_템플릿.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     targets = {}
     for (y, m) in tmonths:
