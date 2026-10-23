@@ -1048,8 +1048,17 @@ def date_col(label):
 
 
 # ─────────────────────────────── 상품군 · 목표 ───────────────────────────────
-DEFAULT_GROUP_RULES = [("기저귀", "반려견 기저귀"), ("장작", "장작"), ("필름", "보호필름"), ("필터", "차량용 필터"),
-                       ("냄비", "주방(냄비·팬)"), ("팬", "주방(냄비·팬)"), ("웍", "주방(냄비·팬)")]
+# (키워드, 상품군). 상품군이 처음 나오는 순서가 화면에 보이는 순서입니다.
+DEFAULT_GROUP_RULES = [("장작", "장작"), ("필터", "차량용 공기필터"), ("두부모래", "네이버 두부모래"),
+                       ("필름", "모니터보호필름"), ("기저귀", "강아지 기저귀"),
+                       ("냄비", "주방용품"), ("팬", "주방용품"), ("웍", "주방용품")]
+
+
+def gsort(groups) -> list:
+    """상품군을 규칙에 적은 순서대로 정렬 (규칙에 없는 상품군·'기타'는 뒤로, 가나다순)."""
+    order = st.session_state.get("_group_order") or list(dict.fromkeys(g for _, g in DEFAULT_GROUP_RULES))
+    rank = {g: i for i, g in enumerate(order)}
+    return sorted(set(groups), key=lambda g: (g == "기타", rank.get(g, len(rank)), str(g)))
 
 
 def group_of(name: str, rules) -> str:
@@ -1109,7 +1118,7 @@ def render_po_tab(ctx):
         sel = st.selectbox("📅 월", months, index=months.index(cur) if cur in months else len(months) - 1,
                            format_func=mlabel, key="rev_month")
     with c2:
-        sel_g = st.multiselect("상품군 (비우면 전체)", sorted({f["group"] for f in fcs}), key="rev_groups")
+        sel_g = st.multiselect("상품군 (비우면 전체)", gsort(f["group"] for f in fcs), key="rev_groups")
     with c3:
         sel_c = st.multiselect("구분 (비우면 전체)", sorted({f_cat(f) for f in fcs}), key="rev_cats")
     view = [f for f in fcs if (not sel_g or f["group"] in sel_g) and (not sel_c or f_cat(f) in sel_c)]
@@ -1178,18 +1187,20 @@ def render_po_tab(ctx):
     names = list(df["품명(PO)"])
     if st.session_state.get("po_pick") not in names:
         st.session_state["po_pick"] = names[0]
-    if _HAS_SELECT:
-        event = wide(st.dataframe, show, hide_index=True, column_config=ccfg,
-                     on_select="rerun", selection_mode="single-row", key="po_tbl")
-        rows_sel = list(event.selection.rows) if event is not None and event.selection is not None else []
-        picked = str(show.iloc[rows_sel[0]]["품명(PO)"]) if rows_sel else None
-        if picked and picked != st.session_state.get("_last_po_row"):
-            st.session_state["_last_po_row"] = picked
-            st.session_state["po_pick"] = picked
-        elif not picked:
-            st.session_state["_last_po_row"] = None
-    else:
-        wide(st.dataframe, show, hide_index=True, column_config=ccfg)
+    g_tot = pd.Series(index=gsort(df["상품군"]), dtype=float)
+
+    def po_header(g, sub):
+        tot, a, c = sub["예상 매출"].sum(), sub["실적"].sum(), sub["확정"].sum()
+        loss = sub["재고부족 손실"].sum()
+        t = ctx["targets"].get(sel, {}).get(g)
+        late = int((sub["지연"] == "⏰").sum())
+        return (f"**{g}** · {len(sub)}개 · 예상 {won_s(tot)}"
+                + (f" / 목표 {won_s(t)} ({tot / t:.0%})" if t else "")
+                + f" · 확보 {won_s(a + c)}"
+                + (f" · ⛔ 손실 {won_s(loss)}" if loss else "")
+                + (f" · ⏰ 지연 {late}" if late else ""))
+
+    grouped_tables(show, "상품군", "품명(PO)", "po_tbl", "po_pick", ccfg, list(g_tot.index), po_header, "po_grouped")
     st.caption("차기 PO: VF형은 마지막 PO 이후 실제 출고 누적이 'PO 1회 수량'을 채우는 날, 밀크런은 마지막(확정 포함) PO + PO 간격. "
                "⏰ = 예상일이 지났는데 PO가 없음 (재고 부족·쿠팡 발주 보류 등 확인 필요)."
                + (" 토·일 예측분은 월요일로 옮깁니다." if cfg["weekend"] else ""))
@@ -1215,7 +1226,7 @@ def render_po_tab(ctx):
                                      name="수요 기준(재고 무제한)", mode="lines+markers",
                                      line=dict(color=C["loss"], dash="dash"), hovertemplate="%{y:,.0f}원"))
     else:
-        for i, g in enumerate(sorted({f["group"] for f in view})):
+        for i, g in enumerate(gsort(f["group"] for f in view)):
             fs = [f for f in view if f["group"] == g]
             fig.add_trace(go.Bar(x=labels, y=[month_tot(fs, mm, vat_incl) for mm in cm], name=g,
                                  marker_color=GROUP_COLORS[i % len(GROUP_COLORS)], hovertemplate="%{y:,.0f}원"))
@@ -1245,7 +1256,7 @@ def group_rows(view, sel, ctx, with_targets=True):
     gs = {f["group"] for f in view}
     if with_targets:      # 매출 데이터는 없어도 목표가 있는 상품군(예: 네이버 두부모래)도 표에 보이게
         gs |= {g for g, v in ctx["targets"].get(sel, {}).items() if g != "전체" and v}
-    for g in sorted(gs):
+    for g in gsort(gs):
         fs = [f for f in view if f["group"] == g]
         a, c, p = (month_tot(fs, sel, vat, k) for k in ("실적", "확정", "예측"))
         tot = a + c + p
@@ -1260,7 +1271,7 @@ def group_rows(view, sel, ctx, with_targets=True):
                      "재고부족 손실": int(dem - tot), "SKU": len(fs)})
     df = pd.DataFrame(rows)
     df["데이터"] = ["" if n else "매출 데이터 없음 ('기타매출' 시트에 입력)" for n in df["SKU"]]
-    return df.sort_values(["예상 매출", "목표"], ascending=False, na_position="last").reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 
 def won_s(v) -> str:
@@ -1276,6 +1287,40 @@ def pct_s(v, sign=False) -> str:
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return "-"
     return f"{v:+.0f}%" if sign else f"{v:.0f}%"
+
+
+def selectable_table(df, name_col, key, pick_key, ccfg, height=None):
+    """행 선택 가능한 표. 새로 고른 행의 품명을 session_state[pick_key]에 넣는다."""
+    kw = dict(hide_index=True, column_config=ccfg)
+    if height:
+        kw["height"] = height
+    if not _HAS_SELECT:
+        wide(st.dataframe, df, **kw)
+        return
+    event = wide(st.dataframe, df, on_select="rerun", selection_mode="single-row", key=key, **kw)
+    rows_sel = list(event.selection.rows) if event is not None and event.selection is not None else []
+    picked = str(df.iloc[rows_sel[0]][name_col]) if rows_sel else None
+    last = f"_last_{key}"
+    if picked and picked != st.session_state.get(last):
+        st.session_state[last] = picked
+        st.session_state[pick_key] = picked
+    elif not picked:
+        st.session_state[last] = None
+
+
+def grouped_tables(df, group_col, name_col, key, pick_key, ccfg, groups, header_fn, toggle_key):
+    """상품군별로 묶어 보기: 그룹마다 접고 펼 수 있는 표 + 그룹 소계를 제목에 표시. 끄면 한 장의 표."""
+    if not toggle("상품군별로 묶어 보기", True, key=toggle_key):
+        selectable_table(df, name_col, key, pick_key, ccfg)
+        return
+    sub_cfg = {k: v for k, v in ccfg.items() if k != group_col}
+    for g in groups:
+        sub = df[df[group_col] == g].drop(columns=[group_col]).reset_index(drop=True)
+        if not len(sub):
+            continue
+        with st.expander(header_fn(g, sub), expanded=True):
+            gk = hashlib.md5(str(g).encode()).hexdigest()[:6]
+            selectable_table(sub, name_col, f"{key}_{gk}", pick_key, sub_cfg, height=min(36 * len(sub) + 40, 460))
 
 
 def render_group_section(view, sel, ctx, with_targets=True):
@@ -1569,7 +1614,7 @@ def render_inventory(ctx):
     base, items, df = ctx["base"], ctx["items"], ctx["inv_df"]
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        g_sel = st.multiselect("상품군 (비우면 전체)", sorted(df["상품군"].unique()), key="inv_groups")
+        g_sel = st.multiselect("상품군 (비우면 전체)", gsort(df["상품군"]), key="inv_groups")
     with c2:
         c_sel = st.multiselect("구분 (비우면 전체)", sorted(df["구분"].unique()), key="inv_cats")
     with c3:
@@ -1596,18 +1641,21 @@ def render_inventory(ctx):
     if not names:
         st.info("조건에 맞는 품목이 없습니다.")
         return
-    if _HAS_SELECT:
-        event = wide(st.dataframe, show, hide_index=True, column_config=inv_colcfg(),
-                     on_select="rerun", selection_mode="single-row", key="master_tbl")
-        rows_sel = list(event.selection.rows) if event is not None and event.selection is not None else []
-        picked = str(show.iloc[rows_sel[0]]["품명"]) if rows_sel else None
-        if picked and picked != st.session_state.get("_last_row_pick"):
-            st.session_state["_last_row_pick"] = picked
-            st.session_state[SKU_KEY] = picked
-        elif not picked:
-            st.session_state["_last_row_pick"] = None
-    else:
-        wide(st.dataframe, show, hide_index=True, column_config=inv_colcfg())
+    if st.session_state.get(SKU_KEY) not in names:
+        st.session_state[SKU_KEY] = names[0]
+    g_order = gsort(view["상품군"])
+
+    def inv_header(g, sub):
+        t = view[view["상품군"] == g]["_tier"]
+        cnt = [("🔴", int((t <= 1).sum())), ("🟠", int(t.isin([1.5, 2]).sum())), ("🟡", int((t == 3).sum())),
+               ("🟢", int((t == 4).sum())), ("⚪", int((t == 5).sum()))]
+        rec = sub["권장 발주량"].fillna(0)[t.reset_index(drop=True) <= 3].sum() if "권장 발주량" in sub else 0
+        dl = sub["발주 데드라인"].dropna() if "발주 데드라인" in sub else []
+        return (f"**{g}** · {len(sub)}개 · " + " ".join(f"{e} {n}" for e, n in cnt if n)
+                + (f" · 가장 급한 데드라인 {min(dl):%m/%d}" if len(dl) else "")
+                + (f" · 권장 발주 합 {rec:,.0f}개" if rec else ""))
+
+    grouped_tables(show, "상품군", "품명", "master_tbl", SKU_KEY, inv_colcfg(), g_order, inv_header, "inv_grouped")
     with st.expander("ℹ️ 상태·데드라인 계산 기준"):
         st.markdown(
             "- **발주 데드라인** = (발주완료 입고분을 반영하고도 끝까지 회복되지 않는 안전재고 이탈일/결품일) − 리드타임\n"
@@ -1961,7 +2009,7 @@ def build_report(ctx) -> bytes:
             rows.append(row)
         out["월별매출_SKU"] = pd.DataFrame(rows).sort_values(["상품군", mlab(cur)], ascending=[True, False])
         g = []
-        for grp in sorted({f["group"] for f in fcs}):
+        for grp in gsort(f["group"] for f in fcs):
             fs = [f for f in fcs if f["group"] == grp]
             row = {"상품군": grp}
             for mm in cm:
@@ -2227,8 +2275,9 @@ def main():
         sec("🏷️ 상품군 기준", "품명에 키워드가 들어 있으면 그 상품군으로 묶습니다. 위에서부터 먼저 맞는 규칙을 씁니다.")
         gedit = st.data_editor(pd.DataFrame(DEFAULT_GROUP_RULES, columns=["키워드", "상품군"]),
                                num_rows="dynamic", hide_index=True, key="group_rules")
-        rules = [(str(r_["키워드"]), str(r_["상품군"])) for _, r_ in gedit.iterrows()
+        rules = [(str(r_["키워드"]).strip(), str(r_["상품군"]).strip()) for _, r_ in gedit.iterrows()
                  if clean_txt(r_["키워드"]) and clean_txt(r_["상품군"])]
+    st.session_state["_group_order"] = list(dict.fromkeys(g for _, g in rules))
 
     hy, hm = add_months(base.year, base.month, FORECAST_MONTHS - 1)
     horizon_end = month_end(hy, hm)
@@ -2240,7 +2289,7 @@ def main():
         f["group"] = group_of(f["name"], rules)
     fcs += manual_entries(wb.get("manual", []), base)
     item_group = {i.name: group_of(i.name, rules) for i in items}
-    groups = sorted(set(item_group.values()) | {f["group"] for f in fcs})
+    groups = gsort(set(item_group.values()) | {f["group"] for f in fcs})
 
     tmonths = [add_months(base.year, base.month, i) for i in range(FORECAST_MONTHS)]
     with t_data:
@@ -2249,12 +2298,12 @@ def main():
             "마스터 엑셀에 '목표' 시트로 넣어 두세요 (다음 업로드부터 자동으로 채워짐).")
         xt = wb.get("targets", {})
         tdf = pd.DataFrame([{"상품군": g, **{f"{y}-{m:02d}": (xt.get((y, m), {}).get(g)) for y, m in tmonths}}
-                            for g in ["전체"] + list(dict.fromkeys(EXTRA_TARGET_GROUPS + groups
-                                                                     + sorted({g_ for d in xt.values() for g_ in d} - {"전체"})))])
+                            for g in ["전체"] + gsort(set(EXTRA_TARGET_GROUPS + groups)
+                                                      | ({g_ for d in xt.values() for g_ in d} - {"전체"}))])
         tedit = st.data_editor(tdf, hide_index=True, key=f"targets_{sig}", disabled=["상품군"],
                                column_config={f"{y}-{m:02d}": st.column_config.NumberColumn(f"{y}-{m:02d}", min_value=0, format="%d")
                                               for y, m in tmonths})
-        st.download_button("⬇️ 목표 시트 템플릿 (.xlsx)", target_template(list(dict.fromkeys(EXTRA_TARGET_GROUPS + groups)), tmonths), file_name="목표_템플릿.xlsx",
+        st.download_button("⬇️ 목표 시트 템플릿 (.xlsx)", target_template(gsort(EXTRA_TARGET_GROUPS + groups), tmonths), file_name="목표_템플릿.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.divider()
         sec("🧾 쿠팡 외 매출 직접 입력 ('기타매출' 시트)",
