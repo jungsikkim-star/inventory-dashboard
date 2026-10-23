@@ -37,6 +37,7 @@ import calendar
 import dataclasses
 import difflib
 import hashlib
+import html
 import math
 import re
 import statistics
@@ -980,6 +981,25 @@ CSS = """
 .kicker {font-size: .8rem; letter-spacing: .03em; opacity: .62; margin-bottom: .1rem;}
 .sec {font-size: 1.05rem; font-weight: 700; margin: .4rem 0 .3rem 0;}
 .muted {opacity: .65; font-size: .85rem;}
+.tg-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 6px 0 4px 0;}
+.tg-card {border: 1px solid rgba(127,127,127,0.2); border-left: 5px solid #b0b7c3; border-radius: 10px;
+  padding: 10px 12px 9px 12px; background: rgba(127,127,127,0.04);}
+.tg-card.ok {border-left-color: #2a9d8f;} .tg-card.mid {border-left-color: #e9b949;} .tg-card.low {border-left-color: #e76f51;}
+.tg-card.total {background: rgba(31,78,121,0.07);}
+.tg-top {display: flex; justify-content: space-between; align-items: center; gap: 6px; margin-top: 3px;}
+.tg-name {font-weight: 700; font-size: .92rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;}
+.tg-tag {font-size: .72rem; padding: 1px 7px; border-radius: 10px; white-space: nowrap;}
+.ok .tg-tag {background: rgba(42,157,143,.15); color: #1f7a6f;} .mid .tg-tag {background: rgba(233,185,73,.2); color: #8a6a10;}
+.low .tg-tag {background: rgba(231,111,81,.15); color: #b2482d;} .none .tg-tag {background: rgba(127,127,127,.12); color: #777;}
+.tg-val {font-size: 1.3rem; font-weight: 800; line-height: 1.2; white-space: nowrap;}
+.tg-val small {font-size: .8rem; font-weight: 600; opacity: .7; margin-left: 4px;}
+.tg-bar {position: relative; height: 9px; border-radius: 5px; background: rgba(127,127,127,0.15); margin: 8px 0 6px 0; overflow: visible;}
+.tg-bar span {position: absolute; top: 0; height: 9px;}
+.tg-bar .a {background: #1f4e79; border-radius: 5px 0 0 5px;} .tg-bar .c {background: #2a9d8f;} .tg-bar .p {background: #9ecae1;}
+.tg-bar i {position: absolute; top: -4px; width: 2px; height: 17px; background: #222;}
+.tg-sub {font-size: .78rem; opacity: .75; line-height: 1.45;}
+.tg-legend {font-size: .74rem; opacity: .7; margin-top: 2px;}
+.tg-legend b {display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin: 0 3px 0 8px; vertical-align: -1px;}
 </style>
 """
 
@@ -1746,6 +1766,54 @@ def render_inventory(ctx):
 
 
 # ─────────────────────────────── 홈 ───────────────────────────────
+def _tg_card(name, a, c, p, tgt, total=False) -> str:
+    """상품군 하나의 목표 카드 HTML. a=실적, c=확정, p=예측(원), tgt=목표(원)."""
+    sec_ = a + c
+    exp = sec_ + p
+    ws = lambda v: won_s(v) if abs(v) >= 0.5 else "0원"
+    if tgt:
+        r_sec, r_exp = sec_ / tgt, exp / tgt
+        cls, tag = (("ok", "달성") if r_sec >= 1 else ("ok", "달성 예상") if r_exp >= 1
+                    else ("mid", "근접") if r_exp >= 0.9 else ("low", "미달 예상"))
+        gap = tgt - exp
+        foot = (f"목표 <b>{won_s(tgt)}</b> · 예상 {ws(exp)}<br>"
+                + f"예상 {r_exp:.0%} · " + (f"{won_s(gap)} 부족" if gap > 0 else f"+{won_s(-gap)} 초과"))
+        rate = f"<small>{r_sec:.0%}</small>"
+    else:
+        cls, tag, rate = "none", "목표 없음", ""
+        foot = f"예상 {ws(exp)}<br>목표 미입력"
+    scale = max(tgt or 0, exp, 1) * 1.04
+    w = lambda v: f"{max(v, 0) / scale * 100:.2f}%"
+    bar = (f"<span class='a' style='left:0;width:{w(a)}'></span>"
+           f"<span class='c' style='left:{w(a)};width:{w(c)}'></span>"
+           f"<span class='p' style='left:{w(sec_)};width:{w(p)}'></span>"
+           + (f"<i style='left:{w(tgt)}'></i>" if tgt else ""))
+    return (f"<div class='tg-card {cls}{' total' if total else ''}'>"
+            f"<div class='tg-name' title='{html.escape(name)}'>{html.escape(name)}</div>"
+            f"<div class='tg-top'><span class='tg-val'>{ws(sec_)}{rate}</span><span class='tg-tag'>{tag}</span></div>"
+            f"<div class='tg-bar'>{bar}</div><div class='tg-sub'>{foot}</div></div>")
+
+
+def target_cards(fcs, month, ctx):
+    """상품군별 목표 · 달성액(확보 = 실적+확정) · 달성률 카드. 맨 앞은 전체."""
+    vat, tg = ctx["vat_incl"], ctx["targets"].get(month, {})
+    parts = lambda fs: tuple(month_tot(fs, month, vat, k) for k in ("실적", "확정", "예측"))
+    groups = gsort({f["group"] for f in fcs} | {g for g, v in tg.items() if g != "전체" and v})
+    cards = [_tg_card("전체", *parts(fcs), total_target(ctx["targets"], month), total=True)]
+    for g in groups:
+        fs = [f for f in fcs if f["group"] == g]
+        a, c, p = parts(fs)
+        if a + c + p > 0 or tg.get(g):
+            cards.append(_tg_card(g, a, c, p, tg.get(g)))
+    sec(f"🎯 {month[1]}월 상품군별 목표 달성", "큰 숫자 = 달성액(실적+확정)과 목표 대비 % · 검은 선 = 목표")
+    st.markdown("<div class='tg-grid'>" + "".join(cards) + "</div>"
+                "<div class='tg-legend'><b style='background:#1f4e79'></b>실적<b style='background:#2a9d8f'></b>확정"
+                "<b style='background:#9ecae1'></b>예측<b style='background:#222;width:2px'></b> 목표</div>",
+                unsafe_allow_html=True)
+    if not tg:
+        st.caption("목표가 없습니다. '🛠️ 데이터 설정' 탭에서 입력하거나 엑셀 '목표' 시트에 넣어 두세요.")
+
+
 def render_home(ctx):
     base, fcs, vat, inv = ctx["base"], ctx["fcs"], ctx["vat_incl"], ctx["inv_df"]
     cur = (base.year, base.month)
@@ -1774,9 +1842,8 @@ def render_home(ctx):
     c[2].metric("🏭 지금 공장 발주", f"{n_now}개 SKU", delta=f"14일 내 {n_soon}개 더", delta_color="off")
     c[3].metric("⛔ 재고부족 손실 (이번 달)", won(r_dem - r_all) if fcs else "-",
                 delta=(f"확정 PO 납품 위험 {won(risk)}" if risk else None), delta_color="inverse")
-    if tgt:
-        show_progress(r_act + r_conf, tgt, f"{cur[1]}월 확보")
-        show_progress(r_all, tgt, f"{cur[1]}월 예상")
+    st.write("")
+    target_cards(fcs, cur, ctx)
 
     st.write("")
     a, b, cc = st.columns(3)
@@ -2349,6 +2416,11 @@ def main():
     alerts = []
     if unmatched or fuzzy:
         alerts.append(f"PO 품명 매칭 확인 필요: 미매칭 {len(unmatched)}개, 유사 매칭 {len(fuzzy)}개 → '🛠️ 데이터 설정' 탭")
+    etc = sorted({n for n, g in item_group.items() if g == "기타"} |
+                 {f["name"] for f in fcs if f["group"] == "기타" and not f.get("manual")})
+    if etc:
+        alerts.append(f"상품군이 정해지지 않은 품목 {len(etc)}개 ('기타'로 집계): {', '.join(etc)} "
+                      "→ '🛠️ 데이터 설정' 탭 상품군 규칙에 키워드를 추가하세요.")
     ctx["home_alerts"] = alerts
 
     with report_slot:
