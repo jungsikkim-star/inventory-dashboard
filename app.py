@@ -981,6 +981,23 @@ CSS = """
 .kicker {font-size: .8rem; letter-spacing: .03em; opacity: .62; margin-bottom: .1rem;}
 .sec {font-size: 1.05rem; font-weight: 700; margin: .4rem 0 .3rem 0;}
 .muted {opacity: .65; font-size: .85rem;}
+.app-title {font-size: 1.35rem; font-weight: 800; letter-spacing: -0.01em; margin: 0 0 2px 0;}
+.kpi-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 4px;}
+.kpi {border: 1px solid rgba(127,127,127,0.2); border-radius: 12px; padding: 12px 16px; background: rgba(127,127,127,0.05);}
+.kpi .l {font-size: .8rem; opacity: .7;} .kpi .v {font-size: 1.55rem; font-weight: 800; line-height: 1.25; margin: 2px 0;}
+.kpi .s {font-size: .8rem; opacity: .72;} .kpi .s.bad {color: #b2482d; opacity: 1;} .kpi .s.good {color: #1f7a6f; opacity: 1;}
+.chips {display: flex; flex-wrap: wrap; gap: 6px; margin: 2px 0 8px 0;}
+.chip {font-size: .76rem; padding: 2px 9px; border-radius: 12px; background: rgba(127,127,127,.12); white-space: nowrap;}
+.chip.r {background: rgba(231,111,81,.15); color: #b2482d;} .chip.o {background: rgba(244,162,97,.18); color: #9a5a1c;}
+.chip.y {background: rgba(233,185,73,.2); color: #8a6a10;}
+.hl {max-height: 330px; overflow-y: auto; padding-right: 4px;}
+.hl-row {display: flex; gap: 9px; align-items: flex-start; padding: 7px 0; border-bottom: 1px solid rgba(127,127,127,.12);}
+.hl-row:last-child {border-bottom: none;}
+.hl-dot {width: 9px; height: 9px; border-radius: 50%; margin-top: 6px; flex: none;}
+.hl-main {flex: 1; min-width: 0;} .hl-name {font-size: .88rem; font-weight: 600; line-height: 1.35;}
+.hl-sub {font-size: .76rem; opacity: .68; line-height: 1.35;}
+.hl-r {text-align: right; font-size: .8rem; white-space: nowrap; line-height: 1.35;} .hl-r small {display: block; opacity: .65;}
+.hl-date {font-size: .74rem; font-weight: 700; opacity: .6; margin: 8px 0 0 0;}
 .tg-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 6px 0 4px 0;}
 .tg-card {border: 1px solid rgba(127,127,127,0.2); border-left: 5px solid #b0b7c3; border-radius: 10px;
   padding: 10px 12px 9px 12px; background: rgba(127,127,127,0.04);}
@@ -1065,6 +1082,45 @@ def pct_col(label, mx=150):
 
 def date_col(label):
     return st.column_config.DateColumn(label, format="MM/DD")
+
+
+# ─────────────────────────────── 화면용 짧은 품명 ───────────────────────────────
+BRANDS = ("코멧", "탐사", "홈플래닛", "벤플")
+_SHORT_SUBS = [(r"\(([^)]*)\)", r" \1"), ("入", "입"), (r"3중\s*방습\s*국산\s*", ""), (r"IH\s*인덕션", "인덕션"),
+               (r"(반려동물|반려견)\s*", ""), (r"남아용", "남아"), (r"여아용", "여아"), (r"키친\s*", ""),
+               (r"^차량용\s*", ""), (r"\s*1개$", "")]
+
+
+def short_name(name: str) -> str:
+    """'Box_코멧 키친 세라믹 냄비 3종 세트 베이지, 양수 냄비 16cm + …' → '세라믹 냄비 3종 세트 베이지'"""
+    s = re.sub(r"^Box_", "", str(name).strip())
+    for b in BRANDS:
+        s = re.sub(rf"^{b}\s+", "", s)
+
+    def bracket(m):            # [DIEB BLACK]처럼 영문이거나 이미 앞에 있는 말이면 지우고, 아니면 괄호만 벗김
+        t = m.group(1).strip()
+        return "" if not re.search(r"[가-힣]", t) or t in s.replace(m.group(0), "") else " " + t
+    s = re.sub(r"\[([^\]]*)\]", bracket, s)
+    parts = [p.strip() for p in s.split(",")]
+    s = " ".join(p for i, p in enumerate(parts) if i == 0 or not ("+" in p and len(p) > 14))   # 세트 구성 설명 제거
+    for pat, r in _SHORT_SUBS:
+        s = re.sub(pat, r, s)
+    s = re.sub(r"\s*\+\s*", "+", s)
+    return re.sub(r"\s+", " ", s).strip() or str(name)
+
+
+def set_short_names(names):
+    """짧은 이름이 서로 겹치면(다른 품목인데) 원래 이름을 쓴다."""
+    sh, owner = {}, {}
+    for n in names:
+        k = short_name(n)
+        owner.setdefault(k, set()).add(clean_txt(n))
+        sh[n] = k
+    st.session_state["_short"] = {n: (k if len(owner[k]) == 1 else n) for n, k in sh.items()}
+
+
+def disp(name) -> str:
+    return (st.session_state.get("_short") or {}).get(name) or str(name)
 
 
 # ─────────────────────────────── 상품군 · 목표 ───────────────────────────────
@@ -1264,7 +1320,7 @@ def render_po_tab(ctx):
     # ── SKU 상세
     st.divider()
     sec("🔍 SKU 상세 · 예상 매출 · PO 일정 · 예측 근거")
-    pick = st.selectbox("품목 선택:", names, key="po_pick")
+    pick = st.selectbox("품목 선택:", names, key="po_pick", format_func=disp)
     with box():
         render_po_detail(next(x for x in view if x["name"] == pick), base, sel, months, vat_incl, cfg)
 
@@ -1311,6 +1367,10 @@ def pct_s(v, sign=False) -> str:
 
 def selectable_table(df, name_col, key, pick_key, ccfg, height=None):
     """행 선택 가능한 표. 새로 고른 행의 품명을 session_state[pick_key]에 넣는다."""
+    if name_col in df.columns:
+        df = df.copy()
+        df.insert(list(df.columns).index(name_col), "품목", df[name_col].map(disp))
+        ccfg = {**ccfg, name_col: None, "품목": st.column_config.TextColumn("품목", width="medium")}
     kw = dict(hide_index=True, column_config=ccfg)
     if height:
         kw["height"] = height
@@ -1438,7 +1498,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
               help="이미 받은 확정 PO인데 평택 재고·발주완료 입고분으로는 수량이 안 나오는 금액. 예상 매출에는 그대로 포함돼 있으니 납품 가능 여부를 확인하세요.")
 
     fig = go.Figure()
-    lab = [n if len(n) <= 24 else n[:23] + "…" for n in df["품명(PO)"]][::-1]
+    lab = [disp(n) for n in df["품명(PO)"]][::-1]
     fig.add_trace(go.Bar(y=lab, x=list(df["└ 리드타임 내(못 막음)"])[::-1], orientation="h", name="리드타임 내(못 막음)",
                          marker_color="#e76f51", hovertemplate="%{x:,.0f}원"))
     fig.add_trace(go.Bar(y=lab, x=list(df["└ 신규 발주로 회복 가능"])[::-1], orientation="h", name="신규 발주로 회복 가능",
@@ -1448,18 +1508,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
     wide(st.plotly_chart, style_fig(fig, height=fig.layout.height))
 
     ccfg = {c_: num_col(c_) for c_ in ("빠지는 매출", "빠지는 수량", "평택 재고", "└ 리드타임 내(못 막음)", "└ 신규 발주로 회복 가능", "확정 PO 납품 위험")}
-    if _HAS_SELECT:
-        event = wide(st.dataframe, df, hide_index=True, column_config=ccfg,
-                     on_select="rerun", selection_mode="single-row", key="loss_tbl")
-        rs = list(event.selection.rows) if event is not None and event.selection is not None else []
-        picked = str(df.iloc[rs[0]]["품명(PO)"]) if rs else None
-        if picked and picked != st.session_state.get("_last_loss_row"):
-            st.session_state["_last_loss_row"] = picked
-            st.session_state["po_pick"] = picked          # 아래 SKU 상세를 이 품목으로
-        elif not picked:
-            st.session_state["_last_loss_row"] = None
-    else:
-        wide(st.dataframe, df, hide_index=True, column_config=ccfg)
+    selectable_table(df, "품명(PO)", "loss_tbl", "po_pick", ccfg)
     st.caption("빠지는 매출 = 확정·예측 PO 중 평택 재고(+발주완료 입고분)가 모자라 납품 못 할 수량 × 단가. "
                "첫 미납일 = 재고가 처음 모자라는 PO 날짜. 리드타임 내 = 오늘 공장 발주해도 '기준일+리드타임' 전이라 막을 수 없는 손실, "
                "그 이후 손실은 지금 발주하면 회복 가능. 확정 PO 납품 위험 = 이미 받은 PO라 매출에는 넣었지만 재고상 수량이 안 나오는 금액. 공장발주 데드라인은 '재고·공장 발주' 탭 기준입니다. "
@@ -1493,8 +1542,7 @@ def render_po_detail(f, base, sel, months, vat_incl, cfg):
     b.metric("실적 / 확정", f"{won(rev(part('실적')))} / {won(rev(part('확정')))}")
     c.metric("예측", won(rev(part("예측"))), help=f"예측 PO {len(part('예측'))}건")
     d.metric("재고 부족 차감", won(rev(ev, True) - total))
-    e5.metric("차기 PO 예상", (nxt.strftime("%m/%d") + (" ⏰" if f["overdue"] else "")) if nxt else "-",
-              delta=(f"D-{(nxt - base).days}" if nxt else None), delta_color="off")
+    e5.metric("차기 PO 예상", (nxt.strftime("%m/%d") + (" ⏰지연" if f["overdue"] else f" (D-{(nxt - base).days})")) if nxt else "-")
 
     # 예측 근거
     lines = []
@@ -1688,7 +1736,7 @@ def render_inventory(ctx):
     sec("🔍 개별 SKU · 쿠팡 PO 차감 타임라인 & 재고 곡선")
     if st.session_state.get(SKU_KEY) not in names:
         st.session_state[SKU_KEY] = names[0]
-    sku = st.selectbox("품목 선택:", names, key=SKU_KEY)
+    sku = st.selectbox("품목 선택:", names, key=SKU_KEY, format_func=disp)
     it = next(i for i in items if i.name == sku)
     h = hashlib.md5(sku.encode()).hexdigest()[:6]
     trig_mode, trig_value = ctx["trig_mode"], ctx["trig_value"]
@@ -1719,8 +1767,7 @@ def render_inventory(ctx):
         st.markdown(f"**{badge(ev)}** · {ev['status']}")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("평택 재고", f"{it.main:,.0f}개", help=f"VF {it.vf:,.0f}개" if not it.is_milkrun else None)
-        m2.metric("공장발주 데드라인", ev["deadline"].strftime("%Y-%m-%d") if ev["deadline"] else "-",
-                  delta=(f"D-{(ev['deadline'] - base).days}" if ev["deadline"] else None), delta_color="off")
+        m2.metric("공장발주 데드라인", f"{ev['deadline']:%m/%d} (D-{(ev['deadline'] - base).days})" if ev["deadline"] else "-")
         m3.metric("평택 결품 예상일", fmt_md(base, sim["stockout"]))
         m4.metric("권장 발주량", f"{ev['rec_qty']:,}개" if p_adu > 0 else "-")
 
@@ -1833,64 +1880,107 @@ def render_home(ctx):
     n_now = int((inv["_tier"] <= 1).sum())
     n_soon = int(inv["_tier"].isin([2, 3]).sum())
 
-    c = st.columns(4)
-    c[0].metric(f"💰 {cur[1]}월 예상 매출", won(r_all) if fcs else "-",
-                delta=(f"목표 대비 {r_all / tgt:.0%}" if tgt else f"전년 동월 대비 {(r_all / r_ly - 1) * 100:+.0f}%" if r_ly else None),
-                delta_color="off" if tgt else "normal")
-    c[1].metric("✅ 확보 매출 (실적+확정)", won(r_act + r_conf) if fcs else "-",
-                help=f"실적 {won(r_act)} · 확정 {won(r_conf)} · 예측 {won(r_pred)}")
-    c[2].metric("🏭 지금 공장 발주", f"{n_now}개 SKU", delta=f"14일 내 {n_soon}개 더", delta_color="off")
-    c[3].metric("⛔ 재고부족 손실 (이번 달)", won(r_dem - r_all) if fcs else "-",
-                delta=(f"확정 PO 납품 위험 {won(risk)}" if risk else None), delta_color="inverse")
+    exp_sub = (f"목표 {won_s(tgt)} 대비 {r_all / tgt:.0%}" if tgt
+               else f"전년 동월 {won_s(r_ly)} 대비 {(r_all / r_ly - 1) * 100:+.0f}%" if r_ly else "목표 미입력")
+    kpis = [
+        (f"{cur[1]}월 예상 매출", won_s(r_all) if fcs else "-", exp_sub,
+         "good" if tgt and r_all >= tgt else "bad" if tgt and r_all < tgt * 0.9 else ""),
+        ("확보 매출 (실적+확정)", won_s(r_act + r_conf) if fcs else "-",
+         f"실적 {won_s(r_act)} · 확정 {won_s(r_conf)}", ""),
+        ("지금 공장 발주", f"{n_now}개 SKU", f"14일 안에 {n_soon}개 더" if n_soon else "14일 안 추가 없음", "bad" if n_now else ""),
+        ("재고부족 손실 (이번 달)", won_s(r_dem - r_all) if fcs and r_dem - r_all >= 0.5 else "0원",
+         f"확정 PO 중 재고 없음 {won_s(risk)}" if risk else "확정 PO는 모두 재고 있음", "bad" if risk else ""),
+    ]
+    st.markdown("<div class='kpi-grid'>" + "".join(
+        f"<div class='kpi'><div class='l'>{l_}</div><div class='v'>{v_}</div><div class='s {c_}'>{s_}</div></div>"
+        for l_, v_, s_, c_ in kpis) + "</div>", unsafe_allow_html=True)
     st.write("")
     target_cards(fcs, cur, ctx)
 
     st.write("")
+    esc = html.escape
+    dot = {0: "#e76f51", 1: "#e76f51", 1.5: "#f4a261", 2: "#f4a261", 3: "#e9b949"}
+    # ── 1) 공장 발주
+    todo = inv[inv["_tier"].isin([0, 1, 2, 3])]
+    heads = {0: "결품 불가피 · 오늘 발주해도 입고 전 부족", 1: "오늘 발주", 2: "긴급 (7일 안)", 3: "준비 (14일 안)"}
+    f_rows = []
+    for t_, sub in todo.groupby("_tier", sort=True):
+        f_rows.append(f"<div class='hl-date' style='color:{dot[t_]};opacity:1'>{heads[t_]} · {len(sub)}개</div>")
+        for _, r in sub.iterrows():
+            d = r["발주 데드라인"]
+            when = ("지금" if d is None or pd.isna(d) or d <= base else f"{d:%m/%d} (D-{(d - base).days})")
+            qty = f"{r['권장 발주량']:,.0f}개" if pd.notna(r["권장 발주량"]) else "-"
+            f_rows.append(f"<div class='hl-row'><span class='hl-dot' style='background:{dot[t_]}'></span>"
+                          f"<div class='hl-main'><div class='hl-name'>{esc(disp(r['품명']))}</div>"
+                          f"<div class='hl-sub'>{esc(r['상품군'])}</div></div>"
+                          f"<div class='hl-r'>{qty}<small>{when}</small></div></div>")
+    n_red, n_or, n_ye = int((todo["_tier"] <= 1).sum()), int((todo["_tier"] == 2).sum()), int((todo["_tier"] == 3).sum())
+    f_label = ("🏭 **공장 발주** · " + " ".join(x for x in (f"🔴 {n_red}" if n_red else "", f"🟠 {n_or}" if n_or else "",
+                                                       f"🟡 {n_ye}" if n_ye else "") if x)) if len(todo) else "🏭 **공장 발주** · 없음"
+
+    # ── 2) 입고 · 납품 점검
+    c_rows = []
+    for _, r in inv[inv["_tier"] == 1.5].iterrows():
+        c_rows.append(("#f4a261", disp(r["품명"]), "입고 전 결품", r["상세"].replace("🟠 ", "").replace("입고 전 결품 ", "")))
+    for f in fcs:
+        es = [e for e in f["events"] if e["kind"] == "확정" and e.get("risk", 0) > 1e-9]
+        if es:
+            amt = sum(e["risk"] * e["price"] * k for e in es)
+            c_rows.append(("#e76f51", disp(f["name"]), "확정 PO 재고 없음",
+                           f"{es[0]['date']:%m/%d}부터 {sum(e['risk'] for e in es):,.0f}개 모자람 ({won_s(amt)})"))
+    c_label = f"🚚 **입고 · 납품 점검** · {len(c_rows)}건" if c_rows else "🚚 **입고 · 납품 점검** · 없음"
+
+    # ── 3) 쿠팡 PO 일정
+    late = [f for f in fcs if f["overdue"]]
+    ev7 = {}
+    for f in fcs:
+        if f.get("manual"):
+            continue
+        for e in f["events"]:
+            if base < e["date"] <= base + timedelta(days=7) and e["kind"] != "실적":
+                key_ = (e["date"], f["name"], e["kind"])
+                ev7[key_] = ev7.get(key_, 0.0) + ev_rev(e, vat)
+    ev7 = {k_: v_ for k_, v_ in ev7.items() if v_ > 0}          # 재고가 없어 0원인 예측 PO는 숨김
+    p_rows = []
+    if late:
+        p_rows.append("<div class='hl-date'>⏰ 지연 (예상일이 지났는데 PO 없음)</div>")
+        p_rows += [f"<div class='hl-row'><span class='hl-dot' style='background:#e76f51'></span><div class='hl-main'>"
+                   f"<div class='hl-name'>{esc(disp(f['name']))}</div></div>"
+                   f"<div class='hl-r'>{f['next']:%m/%d}<small>예상일</small></div></div>" for f in late]
+    wd = "월화수목금토일"
+    for d_ in sorted({k_[0] for k_ in ev7}):
+        day = sorted(((n_, kd, v_) for (dd, n_, kd), v_ in ev7.items() if dd == d_), key=lambda x: -x[2])
+        p_rows.append(f"<div class='hl-date'>{d_:%m/%d} ({wd[d_.weekday()]}) · {won_s(sum(x[2] for x in day))}</div>")
+        p_rows += [f"<div class='hl-row'><span class='hl-dot' style='background:{C['conf'] if kd == '확정' else C['pred']}'></span>"
+                   f"<div class='hl-main'><div class='hl-name'>{esc(disp(n_))}</div></div>"
+                   f"<div class='hl-r'>{won_s(v_)}<small>{kd}</small></div></div>" for n_, kd, v_ in day]
+    p_label = ("🛒 **쿠팡 PO 일정** · " + (f"⏰ 지연 {len(late)} · " if late else "")
+               + f"7일 {len(ev7)}건 {won_s(sum(ev7.values()))}" if (late or ev7) else "🛒 **쿠팡 PO 일정** · 없음")
+
+    # 제목에 요약이 보이고, 클릭하면 펼쳐짐
     a, b, cc = st.columns(3)
     with a:
-        with box():
-            sec("🏭 공장 발주", "데드라인이 가까운 순")
-            todo = inv[inv["_tier"].isin([0, 1, 2, 3])]
-            if len(todo):
-                wide(st.dataframe, todo[["상태", "품명", "발주 데드라인", "권장 발주량"]], hide_index=True,
-                     column_config={"발주 데드라인": date_col("데드라인"), "권장 발주량": num_col("권장량")},
-                     height=min(36 * len(todo) + 40, 320))
+        with st.expander(f_label, expanded=False):
+            if f_rows:
+                st.caption("급한 순 · 오른쪽 = 권장 발주량 / 데드라인")
+                st.markdown("<div class='hl'>" + "".join(f_rows) + "</div>", unsafe_allow_html=True)
             else:
                 st.success("14일 안에 발주할 품목이 없습니다.")
-            st.caption("자세한 내용은 '재고 · 공장 발주' 탭")
     with b:
-        with box():
-            sec("🚚 입고 · 납품 점검", "신규 발주가 아니라 일정 조정이 필요한 것")
-            rows = [{"구분": "입고 전 결품", "품명": r["품명"], "내용": r["상세"].replace("🟠 ", "")}
-                    for _, r in inv[inv["_tier"] == 1.5].iterrows()]
-            for f in fcs:
-                es = [e for e in f["events"] if e["kind"] == "확정" and e.get("risk", 0) > 1e-9]
-                if es:
-                    amt = sum(e["risk"] * e["price"] * k for e in es)
-                    rows.append({"구분": "확정 PO 재고 없음", "품명": f["name"],
-                                 "내용": f"{es[0]['date']:%m/%d}~ {sum(e['risk'] for e in es):,.0f}개 모자람 ({won(amt)})"})
-            if rows:
-                wide(st.dataframe, pd.DataFrame(rows), hide_index=True, height=min(36 * len(rows) + 40, 320))
+        with st.expander(c_label, expanded=False):
+            if c_rows:
+                st.caption("신규 발주가 아니라 입고·출고 일정 조정이 필요한 것")
+                st.markdown("<div class='hl'>" + "".join(
+                    f"<div class='hl-row'><span class='hl-dot' style='background:{c_}'></span><div class='hl-main'>"
+                    f"<div class='hl-name'>{esc(n_)}</div><div class='hl-sub'><b>{esc(t_)}</b> · {esc(d_)}</div></div></div>"
+                    for c_, n_, t_, d_ in c_rows) + "</div>", unsafe_allow_html=True)
             else:
                 st.success("점검할 항목이 없습니다.")
     with cc:
-        with box():
-            sec("🛒 쿠팡 PO 일정", "지연 PO + 앞으로 7일")
-            rows = [{"일자": f["next"], "품명": f["name"], "구분": "⏰ 지연", "예상 금액": None} for f in fcs if f["overdue"]]
-            for f in fcs:
-                if f.get("manual"):
-                    continue
-                for e in f["events"]:
-                    if base < e["date"] <= base + timedelta(days=7) and e["kind"] != "실적":
-                        rows.append({"일자": e["date"], "품명": f["name"], "구분": e["kind"],
-                                     "예상 금액": int(ev_rev(e, vat))})
-            if rows:
-                pdf = pd.DataFrame(rows)
-                pdf = (pdf.groupby(["일자", "품명", "구분"], as_index=False, dropna=False)["예상 금액"].sum(min_count=1))
-                pdf = pdf[(pdf["구분"] == "⏰ 지연") | (pdf["예상 금액"].fillna(0) > 0)]   # 재고가 없어 0원인 예측 PO는 숨김
-                pdf = pdf.assign(_o=(pdf["구분"] != "⏰ 지연").astype(int)).sort_values(["_o", "일자"]).drop(columns="_o")
-                wide(st.dataframe, pdf, hide_index=True, height=min(36 * len(pdf) + 40, 320),
-                     column_config={"일자": date_col("일자"), "예상 금액": num_col("예상 금액")})
+        with st.expander(p_label, expanded=False):
+            if p_rows:
+                st.caption("지연 PO + 앞으로 7일 (날짜별 합계)")
+                st.markdown("<div class='hl'>" + "".join(p_rows) + "</div>", unsafe_allow_html=True)
             else:
                 st.write("예정된 PO가 없습니다.")
 
@@ -1992,7 +2082,7 @@ def render_simulator(ctx):
         m0, m1 = scenario_metrics(f0, base, vat, cur), scenario_metrics(f1, base, vat, cur)
         so = lambda s: (base + timedelta(days=s["stockout"])) if s["stockout"] is not None else None
         res.append({
-            "품목": nm, "추가 입고": ", ".join(f"{a:%m/%d} {q:,.0f}개" for a, q, _ in sorted(lst)),
+            "품목": disp(nm), "추가 입고": ", ".join(f"{a:%m/%d} {q:,.0f}개" for a, q, _ in sorted(lst)),
             "상태 (전)": badge(ev0), "상태 (후)": badge(ev1),
             "평택 결품일 (전)": so(sim0), "평택 결품일 (후)": so(sim1),
             "다음 발주 데드라인 (후)": ev1["deadline"],
@@ -2015,7 +2105,7 @@ def render_simulator(ctx):
     wide(st.dataframe, rdf, hide_index=True, column_config=ccfg)
     st.caption("회복 매출 = 추가 입고 덕분에 납품 가능해지는 예측 PO 금액. PO 매칭 X = 쿠팡PO 탭과 연결이 안 돼 매출 변화를 계산할 수 없는 품목.")
 
-    pick = st.selectbox("그래프로 볼 품목", list(detail), key="sim_pick")
+    pick = st.selectbox("그래프로 볼 품목", list(detail), key="sim_pick", format_func=disp)
     it, it2, sim0, sim1, f0, f1 = detail[pick]
     l, r = st.columns(2)
     n = 120
@@ -2198,6 +2288,8 @@ def build_notes(ctx):
     no_po = sorted({i.name for i in items} - set(mapping.values()))
     if po_names and no_po:
         notes.append(f"PO 이력이 없는 재고시트 품목 {len(no_po)}개는 매출 예측에서 빠집니다: {', '.join(no_po)}")
+    if ctx.get("fuzzy"):
+        notes.append(f"이름이 달라 '유사'로 자동 매칭한 PO 품명 {len(ctx['fuzzy'])}개: {', '.join(ctx['fuzzy'])} (위 매칭 표에서 확인)")
     if wb.get("manual"):
         m = wb["manual"]
         notes.append(f"엑셀 '기타매출' 시트에서 {len(m)}행, 합계 {won(sum(x['amount'] for x in m))}을 읽었습니다 "
@@ -2215,7 +2307,7 @@ def main():
     # ── 사이드바: 기본
     st.sidebar.markdown("### 📁 데이터")
     up = st.sidebar.file_uploader("통합 마스터 엑셀 (.xlsx)", type=["xlsx"], label_visibility="collapsed")
-    st.title("📦 쿠팡 VF & 평택 발주 · 매출 대시보드")
+    st.markdown("<div class='app-title'>쿠팡 VF · 평택 발주 · 매출 대시보드</div>", unsafe_allow_html=True)
     if not up:
         st.info("👈 왼쪽 사이드바에서 통합 마스터 엑셀을 업로드해 주세요. "
                 "('쿠팡PO' 이력 탭 + 월별 재고 시트, 선택적으로 '목표' 시트)")
@@ -2399,6 +2491,7 @@ def main():
         sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
         calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days))
 
+    set_short_names({i.name for i in items} | {f["name"] for f in fcs})
     po_by_name = {}
     for r in po_recs:
         po_by_name.setdefault(r["name"], []).append(r)
@@ -2413,9 +2506,10 @@ def main():
 
     unmatched = [p for p in po_names if p not in mapping]
     fuzzy = [p for p, v in auto.items() if v[1].startswith("유사") and mapping.get(p) == v[0]]
-    alerts = []
-    if unmatched or fuzzy:
-        alerts.append(f"PO 품명 매칭 확인 필요: 미매칭 {len(unmatched)}개, 유사 매칭 {len(fuzzy)}개 → '🛠️ 데이터 설정' 탭")
+    alerts = []        # 홈 알림은 '조치가 필요한 새 문제'만. 유사 매칭은 데이터 설정 탭 점검 사항으로
+    if unmatched:
+        alerts.append(f"재고시트와 연결되지 않은 PO 품명 {len(unmatched)}개: {', '.join(unmatched)} → '🛠️ 데이터 설정' 탭에서 매칭하세요.")
+    ctx["fuzzy"] = fuzzy
     etc = sorted({n for n, g in item_group.items() if g == "기타"} |
                  {f["name"] for f in fcs if f["group"] == "기타" and not f.get("manual")})
     if etc:
