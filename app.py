@@ -686,19 +686,24 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
     trans_h = [r for r in hard if r != pers_h]
     trans_s = [r for r in soft if r != pers_s]
 
-    cands = []                                   # (신규 발주 데드라인(일), 우선순위, 사유)
+    # 상태(색)는 '결품' 데드라인으로만 정하고, 안전재고 기준 날짜는 '권장 발주일'로 따로 둔다
+    hc = []                                      # (결품 기준 발주 데드라인(일), 사유)
     unavoid = pers_h if (pers_h and pers_h[0] < lt) else None
     if pers_h:
-        cands.append((max(pers_h[0], lt) - lt, 0, f"{pre}{md(pers_h[0])} 결품"))
+        hc.append((max(pers_h[0], lt) - lt, f"{pre}{md(pers_h[0])} 결품"))
     for a, b in trans_h:
         if b >= lt:
-            cands.append((max(a, lt) - lt, 0, f"{md(a)} 결품"))
+            hc.append((max(a, lt) - lt, f"{md(a)} 결품"))
+    hc.sort()
+    d_hard, r_hard = (hc[0] if hc else (None, ""))
+    d_soft, r_soft = None, ""
     if pers_s:
         a = pers_s[0]
-        cands.append((max(a, lt) - lt, 1, f"{pre}안전재고 회복 불가" if a == 0 else f"{pre}{md(a)} 안전재고 이탈"))
-    cands.sort()
-    d_pol = cands[0][0] if cands else None
-    reason = cands[0][2] if cands else ""
+        d_soft, r_soft = max(a, lt) - lt, (f"{pre}안전재고 회복 불가" if a == 0 else f"{pre}{md(a)} 안전재고 이탈")
+    d_pol, reason = d_hard, r_hard
+    d_q = min(x for x in (d_hard, d_soft) if x is not None) if (d_hard is not None or d_soft is not None) else None
+    soft_note = (f" · 안전재고 기준 권장 {md(d_soft)}" if d_soft is not None and d_soft > 0 and (d_hard is None or d_soft < d_hard)
+                 else "")
 
     gap_txt = dip_txt = ""
     if trans_h:
@@ -716,22 +721,28 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
     elif unavoid:
         a = unavoid[0]
         tier, status = 0, f"🚨 결품 불가피 {lt - a}일 ({md(a)}~{md(lt - 1)}) · 오늘 발주해도 신규분 입고({md(lt)}) 전 부족"
-    elif d_pol is None:
-        tier, status = 4, f"✅ 안정 ({n}일 내 이상 없음)"
-    elif d_pol <= 0:
-        tier, status = 1, f"🚨 오늘 발주 ({reason})"
-    elif d_pol <= 7:
-        tier, status = 2, f"⚠️ 긴급 D-{d_pol} ({reason})"
-    elif d_pol <= 14:
-        tier, status = 3, f"🔔 준비 D-{d_pol} ({reason})"
+    elif d_hard is not None and d_hard <= 0:
+        tier, status = 1, f"🚨 오늘 발주 ({r_hard})"
+    elif d_hard is not None and d_hard <= 7:
+        tier, status = 2, f"⚠️ 긴급 D-{d_hard} ({r_hard})"
+    elif d_hard is not None and d_hard <= 14:
+        tier, status = 3, f"🔔 준비 D-{d_hard} ({r_hard})"
+    elif d_soft is not None and d_soft <= 7:     # 결품까지는 여유가 있지만 안전재고 기준 권장일이 지났거나 7일 안
+        tier = 3
+        status = (f"🔔 준비 · 안전재고 기준 권장 발주일 {'지남' if d_soft <= 0 else f'D-{d_soft}'} ({r_soft})"
+                  + (f" · 결품 기준 데드라인 {md(d_hard)}" if d_hard is not None else ""))
+    elif d_hard is not None:
+        tier, status = 4, f"✅ 여유 D-{d_hard} (결품 기준){soft_note}"
+    elif d_soft is not None:
+        tier, status = 4, f"✅ 여유{soft_note} (결품 예상 없음)"
     else:
-        tier, status = 4, f"✅ 여유 D-{d_pol}"
+        tier, status = 4, f"✅ 안정 ({n}일 내 이상 없음)"
 
     if has_demand and not unavoid:
         if gap_txt:
             if tier >= 4 and trans_h[0][0] < lt:         # 신규 발주로는 못 막는 임박한 일시 결품 → 발주 대기가 아니라 입고/출고 일정 점검 대상
                 tier = 1.5
-                status = "🟠 " + gap_txt + ("" if d_pol is None else f" · 신규 발주는 D-{d_pol}")
+                status = "🟠 " + gap_txt + ("" if d_q is None else f" · 신규 발주는 D-{d_q}")
             else:
                 status += " · " + gap_txt
         elif dip_txt and tier >= 4:
@@ -739,8 +750,8 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
 
     # 권장 발주량: 신규 발주분이 도착하는 시점부터 target_days 동안 평택 재고가 기준선(안전재고, 없으면 0) 아래로 내려가는 최대 부족분
     qty = 0.0
-    if has_demand and d_pol is not None and d_pol + lt < n:
-        A = d_pol + lt
+    if has_demand and d_q is not None and d_q + lt < n:
+        A = d_q + lt
         floor = safety if safety > 0 else 0.0
         base_lost = sim["lost"][A - 1] if A >= 1 else 0.0
         end = min(n, A + target_days + 1)
@@ -749,7 +760,8 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
             qty = math.ceil(qty / item.moq - 1e-9) * item.moq
     return dict(tier=tier, status=status, d_pol=d_pol, d_stock=None,
                 safety_day=(soft[0][0] if soft else None), reason=reason, gap=gap_txt, dip=dip_txt,
-                deadline=(base + timedelta(days=d_pol)) if d_pol is not None else None, rec_qty=int(round(qty)))
+                deadline=(base + timedelta(days=d_pol)) if d_pol is not None else None, rec_qty=int(round(qty)),
+                rec_date=(base + timedelta(days=d_soft)) if d_soft is not None else None)
 
 
 def fmt_md(base: date, offset):
@@ -1036,7 +1048,7 @@ toggle = getattr(st, "toggle", st.checkbox)
 
 
 def badge(ev) -> str:
-    if ev["tier"] == 4 and ev["d_pol"] is None:
+    if ev["tier"] == 4 and ev["d_pol"] is None and ev.get("rec_date") is None:
         return "🟢 안정"
     return TIER_BADGE.get(ev["tier"], "")
 
@@ -1668,6 +1680,7 @@ def inventory_table(ctx) -> pd.DataFrame:
             "안전재고 대비": round(it.main / it.safety * 100) if it.safety > 0 else None,
             "일평균출고": round(it.adu, 1), "재고커버(일)": round(total / it.adu) if it.adu > 0 else None,
             "발주 데드라인": d, "D-": (d - base).days if d else None,
+            "권장 발주일": ev["rec_date"],
             "권장 발주량": ev["rec_qty"] if it.adu > 0 and ev["rec_qty"] else None,
             "평택 결품일": off(sim["stockout"]), "안전재고 이탈일": off(ev["safety_day"]),
             "입고예정(발주완료)": int(sum(q for _, q, _ in it.inbound)) or None,
@@ -1681,14 +1694,14 @@ def inventory_table(ctx) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values(["_tier", "_dpol"]).reset_index(drop=True)
 
 
-INV_CORE = ["상태", "품명", "상품군", "평택재고", "안전재고 대비", "재고커버(일)", "발주 데드라인", "D-", "권장 발주량",
+INV_CORE = ["상태", "품명", "상품군", "평택재고", "안전재고 대비", "재고커버(일)", "발주 데드라인", "D-", "권장 발주일", "권장 발주량",
             "평택 결품일", "입고예정(발주완료)", "차기 PO(이력예측)", "상세"]
 
 
 def inv_colcfg():
     ccfg = {c: num_col(c) for c in ("평택재고", "VF재고", "안전재고", "권장 발주량", "입고예정(발주완료)",
                                      "입고계획(미발주)", "출고예정(합)")}
-    ccfg.update({c: date_col(c) for c in ("발주 데드라인", "평택 결품일", "안전재고 이탈일", "차기 PO(이력예측)", "차기 쿠팡PO(시뮬)")})
+    ccfg.update({c: date_col(c) for c in ("발주 데드라인", "권장 발주일", "평택 결품일", "안전재고 이탈일", "차기 PO(이력예측)", "차기 쿠팡PO(시뮬)")})
     ccfg["안전재고 대비"] = pct_col("안전재고 대비", 200)
     ccfg["상세"] = st.column_config.TextColumn("상세", width="large")
     return ccfg
@@ -1742,7 +1755,9 @@ def render_inventory(ctx):
     grouped_tables(show, "상품군", "품명", "master_tbl", SKU_KEY, inv_colcfg(), g_order, inv_header, "inv_grouped")
     with st.expander("ℹ️ 상태·데드라인 계산 기준"):
         st.markdown(
-            "- **발주 데드라인** = (발주완료 입고분을 반영하고도 끝까지 회복되지 않는 안전재고 이탈일/결품일) − 리드타임\n"
+            "- **발주 데드라인** = (발주완료 입고분을 반영하고도 회복되지 않는 **결품일**) − 리드타임. 상태 색은 이 날짜로 정합니다\n"
+            "- **권장 발주일** = (안전재고 45일분 아래로 내려가는 날) − 리드타임. 안전재고를 지키려면 이날까지 발주. "
+            "결품까지 14일 넘게 남았어도 이 날짜가 지났거나 7일 안이면 🟡 준비로 표시\n"
             "- **🟠 입고 전 결품**: 발주완료 입고분으로 곧 회복되지만 그 전에 잠깐 비는 경우. 신규 발주가 아니라 입고 앞당기기·출고 조정 대상\n"
             "- **권장 발주량**: 신규분이 도착한 뒤 산정 기간 동안 안전재고(미기재 품목은 결품 방지) 기준 최대 부족분을 납품 MOQ 배수로 올림\n"
             "- **차기 PO(이력예측)**은 쿠팡PO 탭 이력 기반, **차기 쿠팡PO(시뮬)**은 사이드바 트리거 가정 기반")
@@ -1918,17 +1933,21 @@ def render_home(ctx):
     dot = {0: "#e76f51", 1: "#e76f51", 1.5: "#f4a261", 2: "#f4a261", 3: "#e9b949"}
     # ── 1) 공장 발주
     todo = inv[inv["_tier"].isin([0, 1, 2, 3])]
-    heads = {0: "결품 불가피 · 오늘 발주해도 입고 전 부족", 1: "오늘 발주", 2: "긴급 (7일 안)", 3: "준비 (14일 안)"}
+    heads = {0: "결품 불가피 · 오늘 발주해도 입고 전 부족", 1: "오늘 발주 (결품 기준)", 2: "긴급 (7일 안)",
+             3: "준비 (결품 14일 안 · 또는 안전재고 권장일 임박)"}
     f_rows = []
     for t_, sub in todo.groupby("_tier", sort=True):
         f_rows.append(f"<div class='hl-date' style='color:{dot[t_]};opacity:1'>{heads[t_]} · {len(sub)}개</div>")
         for _, r in sub.iterrows():
-            d = r["발주 데드라인"]
-            when = ("지금" if d is None or pd.isna(d) or d <= base else f"{d:%m/%d} (D-{(d - base).days})")
+            d, rd = r["발주 데드라인"], r["권장 발주일"]
+            ok_d, ok_r = (d is not None and not pd.isna(d)), (rd is not None and not pd.isna(rd))
+            when = ("지금" if t_ == 0 or (ok_d and d <= base) else f"{d:%m/%d} (D-{(d - base).days})" if ok_d else "결품 없음")
             qty = f"{r['권장 발주량']:,.0f}개" if pd.notna(r["권장 발주량"]) else "-"
+            hint = (f" · 안전재고 기준 권장 {'지남' if rd <= base else f'{rd:%m/%d}'}"
+                    if ok_r and (not ok_d or rd < d) and t_ != 0 else "")
             f_rows.append(f"<div class='hl-row'><span class='hl-dot' style='background:{dot[t_]}'></span>"
                           f"<div class='hl-main'><div class='hl-name'>{esc(disp(r['품명']))}</div>"
-                          f"<div class='hl-sub'>{esc(r['상품군'])}</div></div>"
+                          f"<div class='hl-sub'>{esc(r['상품군'])}{hint}</div></div>"
                           f"<div class='hl-r'>{qty}<small>{when}</small></div></div>")
     n_red, n_or, n_ye = int((todo["_tier"] <= 1).sum()), int((todo["_tier"] == 2).sum()), int((todo["_tier"] == 3).sum())
     f_label = ("🏭 **공장 발주** · " + " ".join(x for x in (f"🔴 {n_red}" if n_red else "", f"🟠 {n_or}" if n_or else "",
@@ -1978,7 +1997,7 @@ def render_home(ctx):
     with a:
         with st.expander(f_label, expanded=False):
             if f_rows:
-                st.caption("급한 순 · 오른쪽 = 권장 발주량 / 데드라인")
+                st.caption("급한 순 · 오른쪽 = 권장 발주량 / 결품 기준 데드라인")
                 st.markdown("<div class='hl'>" + "".join(f_rows) + "</div>", unsafe_allow_html=True)
             else:
                 st.success("14일 안에 발주할 품목이 없습니다.")
