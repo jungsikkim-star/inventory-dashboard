@@ -970,7 +970,7 @@ GROUP_COLORS = ["#1f4e79", "#2a9d8f", "#e9b949", "#e76f51", "#8e6bbf", "#5aa9e6"
 
 CSS = """
 <style>
-.block-container {padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1500px;}
+.block-container {padding-top: 3.6rem; padding-bottom: 3rem; max-width: 1500px;}
 [data-testid="stMetric"] {background: rgba(127,127,127,0.06); border: 1px solid rgba(127,127,127,0.18);
   border-radius: 12px; padding: 12px 16px;}
 [data-testid="stMetricLabel"] p {font-size: 0.82rem; opacity: 0.78;}
@@ -998,6 +998,15 @@ CSS = """
 .hl-sub {font-size: .76rem; opacity: .68; line-height: 1.35;}
 .hl-r {text-align: right; font-size: .8rem; white-space: nowrap; line-height: 1.35;} .hl-r small {display: block; opacity: .65;}
 .hl-date {font-size: .74rem; font-weight: 700; opacity: .6; margin: 8px 0 0 0;}
+.hm-wrap {overflow-x: auto; border: 1px solid rgba(127,127,127,0.2); border-radius: 10px; margin-top: 6px;}
+.hm {border-collapse: collapse; width: 100%; font-size: .82rem;}
+.hm th, .hm td {padding: 7px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid rgba(127,127,127,.12);}
+.hm thead th {font-weight: 600; font-size: .78rem; opacity: .75; line-height: 1.2;} .hm thead th small {font-weight: 400;}
+.hm tbody th {text-align: left; font-weight: 600; padding-left: 12px;}
+.hm .cur {box-shadow: inset 2px 0 0 #1f4e79, inset -2px 0 0 #1f4e79;}
+.hm thead th.cur {opacity: 1; color: #1f4e79;}
+.hm-tot th, .hm-tot td {font-weight: 800; border-top: 2px solid rgba(127,127,127,.3); border-bottom: none;}
+.hm-y {font-weight: 600; opacity: .8;}
 .tg-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 6px 0 4px 0;}
 .tg-card {border: 1px solid rgba(127,127,127,0.2); border-left: 5px solid #b0b7c3; border-radius: 10px;
   padding: 10px 12px 9px 12px; background: rgba(127,127,127,0.04);}
@@ -1057,6 +1066,8 @@ def style_fig(fig, height=None, legend=True, title=None):
         lay["height"] = height
     fig.update_layout(**lay)
     fig.update_xaxes(gridcolor="rgba(128,128,128,0.15)")
+    if any(isinstance(x, str) and re.match(r"^\d+년 \d+월$", x) for tr in fig.data for x in (getattr(tr, "x", None) or [])):
+        fig.update_xaxes(type="category")
     fig.update_yaxes(gridcolor="rgba(128,128,128,0.15)", zerolinecolor="rgba(128,128,128,0.3)")
     return fig
 
@@ -1175,6 +1186,11 @@ def f_cat(f):
     return f["item"].cat if f["item"] else "미매칭"
 
 
+def mtick(y, m) -> str:
+    """차트용 월 라벨. '26.10'처럼 쓰면 plotly가 숫자로 읽어 축이 깨지므로 글자로 만든다."""
+    return f"{y % 100}년 {m}월"
+
+
 def mlabel(t):
     return f"{t[0]}년 {t[1]}월"
 
@@ -1289,7 +1305,7 @@ def render_po_tab(ctx):
     mode = st.radio("구성", ["실적·확정·예측", "상품군별"], horizontal=True, key="trend_mode")
     y0, m0 = add_months(cur[0], cur[1], -12)
     cm = [mm for mm in months if mm >= (y0, m0)]
-    labels = [f"{a % 100:02d}.{b:02d}" for a, b in cm]
+    labels = [mtick(a, b) for a, b in cm]
     fig = go.Figure()
     if mode.startswith("실적"):
         for k in ("실적", "확정", "예측"):
@@ -1595,7 +1611,7 @@ def render_po_detail(f, base, sel, months, vat_incl, cfg):
     with g2:   # 이 SKU의 월별 매출
         y0, m0 = add_months(base.year, base.month, -12)
         cm = [mm for mm in months if mm >= (y0, m0)]
-        labels = [f"{a_ % 100:02d}.{b_:02d}" for a_, b_ in cm]
+        labels = [mtick(a_, b_) for a_, b_ in cm]
         fig3 = go.Figure()
         for k, col in (("실적", "#1f4e79"), ("확정", "#2a9d8f"), ("예측", "#9ecae1")):
             fig3.add_trace(go.Bar(x=labels, marker_color=col, name=k, hovertemplate="%{y:,.0f}원",
@@ -1986,34 +2002,43 @@ def render_home(ctx):
 
     if fcs:
         st.write("")
-        l, r = st.columns([1, 1])
-        with l:
-            with box():
-                df = group_rows(fcs, cur, ctx)
-                fig = go.Figure()
-                y = list(df["상품군"])[::-1]
-                for kk in ("실적", "확정", "예측"):
-                    fig.add_trace(go.Bar(y=y, x=list(df[kk])[::-1], orientation="h", name=kk,
-                                         marker_color=C[{"실적": "act", "확정": "conf", "예측": "pred"}[kk]],
-                                         hovertemplate="%{x:,.0f}원"))
-                if df["목표"].notna().any():
-                    fig.add_trace(go.Scatter(y=y, x=list(df["목표"])[::-1], mode="markers", name="목표",
-                                             marker=dict(symbol="line-ns-open", size=22, color="#222", line=dict(width=3))))
-                fig.update_layout(barmode="stack")
-                wide(st.plotly_chart, style_fig(fig, height=max(240, 48 * len(df) + 110), title=f"상품군별 {cur[1]}월 매출"))
-        with r:
-            with box():
-                cm = [add_months(cur[0], cur[1], i) for i in range(-5, FORECAST_MONTHS)]
-                labels = [f"{a_ % 100:02d}.{b_:02d}" for a_, b_ in cm]
-                fig = go.Figure()
-                for kk in ("실적", "확정", "예측"):
-                    fig.add_trace(go.Bar(x=labels, y=[month_tot(fcs, mm, vat, kk) for mm in cm], name=kk,
-                                         marker_color=C[{"실적": "act", "확정": "conf", "예측": "pred"}[kk]],
-                                         hovertemplate="%{y:,.0f}원"))
-                fig.add_trace(go.Scatter(x=labels, y=[month_tot(fcs, (mm[0] - 1, mm[1]), vat, "실적") for mm in cm],
-                                         name="전년 동월", mode="lines+markers", line=dict(color=C["ly"], dash="dot")))
-                fig.update_layout(barmode="stack", hovermode="x unified")
-                wide(st.plotly_chart, style_fig(fig, height=max(240, 48 * len(df) + 110), title="월별 매출 (최근 6개월 + 예측)"))
+        month_heatmap(fcs, cur, ctx)
+
+
+def month_heatmap(fcs, cur, ctx, n=12):
+    """상품군 × 최근 12개월 매출표. 칸 색이 진할수록 그 상품군 안에서 매출이 큰 달 (시즌 패턴 확인용)."""
+    vat = ctx["vat_incl"]
+    months = [add_months(cur[0], cur[1], i) for i in range(-(n - 1), 1)]
+    groups = gsort(f["group"] for f in fcs)
+    data = {g: [month_tot([f for f in fcs if f["group"] == g], mm, vat) for mm in months] for g in groups}
+    data = {g: v for g, v in data.items() if any(v)}
+    if not data:
+        return
+    total = [sum(v[i] for v in data.values()) for i in range(len(months))]
+    ly = {g: month_tot([f for f in fcs if f["group"] == g], (cur[0] - 1, cur[1]), vat, "실적") for g in data}
+
+    def row(name, vals, ly_v, bold=False):
+        mx = max(vals) or 1
+        tds = []
+        for k_, v in enumerate(vals):
+            a_ = 0.06 + 0.6 * (v / mx) if v else 0
+            fg = "#fff" if v / mx > 0.62 else "inherit"
+            cur_ = " cur" if k_ == len(vals) - 1 else ""
+            tds.append(f"<td class='hm-c{cur_}' style='background:rgba(31,78,121,{a_:.2f});color:{fg}'>"
+                       f"{won_s(v) if v >= 0.5 else '·'}</td>")
+        yoy = (f"{(vals[-1] / ly_v - 1) * 100:+.0f}%" if ly_v else "-")
+        cls = " class='hm-tot'" if bold else ""
+        return f"<tr{cls}><th>{html.escape(name)}</th>{''.join(tds)}<td class='hm-y'>{yoy}</td></tr>"
+
+    head = "".join(f"<th class='{'cur' if k_ == len(months) - 1 else ''}'>{mm[1]}월" + ("<br><small>(예상)</small>" if k_ == len(months) - 1 else
+                   (f"<br><small>{mm[0] % 100}년</small>" if mm[1] == 1 or k_ == 0 else "")) + "</th>"
+                   for k_, mm in enumerate(months))
+    body = "".join(row(g, v, ly[g]) for g, v in data.items())
+    body += row("합계", total, sum(ly.values()), bold=True)
+    sec(f"📅 상품군별 월 매출 (최근 {n}개월)",
+        "색이 진할수록 그 상품군 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측 · 오른쪽 = 이번 달 전년 동월 대비")
+    st.markdown(f"<div class='hm-wrap'><table class='hm'><thead><tr><th></th>{head}<th>전년비</th></tr></thead>"
+                f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
 
 
 # ─────────────────────────────── 공장 발주 시뮬레이터 ───────────────────────────────
@@ -2123,7 +2148,7 @@ def render_simulator(ctx):
         wide(st.plotly_chart, style_fig(fig, height=340, title="평택 재고 (발주 전 vs 후)"))
     with r:
         cm = [add_months(cur[0], cur[1], i) for i in range(FORECAST_MONTHS)]
-        labels = [f"{a_ % 100:02d}.{b_:02d}" for a_, b_ in cm]
+        labels = [mtick(a_, b_) for a_, b_ in cm]
         fut = lambda fs, mm: sum(ev_rev(e, vat) for f in fs for e in f["events"] if e["date"] > base and mkey(e["date"]) == mm)
         fig = go.Figure()
         fig.add_trace(go.Bar(x=labels, y=[fut(f0, mm) for mm in cm], name="발주 전", marker_color=C["before"], hovertemplate="%{y:,.0f}원"))
