@@ -951,8 +951,55 @@ _HAS_SELECT = _ST_VER >= (1, 35)       # st.dataframe(on_select=...) 지원 버�
 SKU_KEY = "sku_sel"
 
 
+class _Fmt:
+    """표 칸 서식 표시용. st.dataframe에 넘기기 전에 wide()가 글자로 바꿔 준다 (Streamlit 버전과 무관하게 같은 모양)."""
+    def __init__(self, kind, label):
+        self.kind, self.label = kind, label
+
+
+_MONEY_WORDS = ("매출", "손실", "금액", "목표", "실적", "확정", "예측", "전월", "전년", "위험", "회복", "증가")
+
+
+def _fmt_value(kind, label, v):
+    if v is None or (isinstance(v, float) and math.isnan(v)) or (not isinstance(v, (str, date)) and pd.isna(v)):
+        return "-"
+    if kind == "date":
+        return v.strftime("%m/%d") if isinstance(v, (date, datetime, pd.Timestamp)) else str(v)
+    if not isinstance(v, (int, float)):
+        return str(v)
+    if "단가" in label:
+        return f"{v:,.0f}원"
+    if any(w in label for w in _MONEY_WORDS) and "수량" not in label:
+        return won_s(v) if abs(v) >= 0.5 else "0"
+    return f"{v:,.0f}"
+
+
+def _prep_table(df, ccfg):
+    """숫자·날짜 칸을 보기 좋은 글자로 바꾸고, 빈 칸(None)은 '-'로."""
+    df = df.copy()
+    out = {}
+    for col, cfg in (ccfg or {}).items():
+        if isinstance(cfg, _Fmt):
+            if col in df.columns:
+                df[col] = [_fmt_value(cfg.kind, cfg.label, v) for v in df[col]]
+            out[col] = st.column_config.TextColumn(cfg.label)
+        else:
+            out[col] = cfg
+    for col in df.columns:
+        if col not in out and df[col].dtype == object:
+            df[col] = [_fmt_value("date", col, v) if isinstance(v, date) else ("-" if v is None or (isinstance(v, float) and math.isnan(v)) else v)
+                       for v in df[col]]
+        elif col not in out and pd.api.types.is_float_dtype(df[col]) and df[col].isna().any():
+            df[col] = ["-" if pd.isna(v) else (f"{v:,.0f}" if float(v).is_integer() else f"{v:,.1f}") for v in df[col]]
+    return df, out
+
+
 def wide(fn, *args, **kw):
-    """Streamlit 버전별 '가로 꽉 채우기' 인자 차이 흡수."""
+    """Streamlit 버전별 '가로 꽉 채우기' 인자 차이 흡수. 표는 칸 서식을 먼저 적용."""
+    if fn is st.dataframe and args and isinstance(args[0], pd.DataFrame):
+        df, cc = _prep_table(args[0], kw.get("column_config"))
+        args = (df,) + args[1:]
+        kw["column_config"] = cc
     order = ({"width": "stretch"}, {"use_container_width": True}) if _ST_VER >= (1, 50) \
         else ({"use_container_width": True}, {"width": "stretch"})
     for extra in order:
@@ -964,7 +1011,8 @@ def wide(fn, *args, **kw):
 
 
 def num_col(label):
-    """천 단위 쉼표 표시 (구버전 Streamlit은 정수 표시)."""
+    """숫자 칸: 금액은 '1.01억/5,639만', 수량은 '1,036' 형태 글자로 표시 (wide()에서 변환)."""
+    return _Fmt("num", label)
 
 
 def won(v: float) -> str:
@@ -1104,7 +1152,7 @@ def pct_col(label, mx=150):
 
 
 def date_col(label):
-    return st.column_config.DateColumn(label, format="MM/DD")
+    return _Fmt("date", label)
 
 
 # ─────────────────────────────── 화면용 짧은 품명 ───────────────────────────────
