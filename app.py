@@ -1058,15 +1058,23 @@ CSS = """
 .hl-sub {font-size: .76rem; opacity: .68; line-height: 1.35;}
 .hl-r {text-align: right; font-size: .8rem; white-space: nowrap; line-height: 1.35;} .hl-r small {display: block; opacity: .65;}
 .hl-date {font-size: .74rem; font-weight: 700; opacity: .6; margin: 8px 0 0 0;}
-.hm-wrap {overflow-x: auto; border: 1px solid rgba(127,127,127,0.2); border-radius: 10px; margin-top: 6px;}
-.hm {border-collapse: collapse; width: 100%; font-size: .82rem;}
-.hm th, .hm td {padding: 7px 8px; text-align: right; white-space: nowrap; border-bottom: 1px solid rgba(127,127,127,.12);}
-.hm thead th {font-weight: 600; font-size: .78rem; opacity: .75; line-height: 1.2;} .hm thead th small {font-weight: 400;}
-.hm tbody th {text-align: left; font-weight: 600; padding-left: 12px;}
-.hm .cur {box-shadow: inset 2px 0 0 #1f4e79, inset -2px 0 0 #1f4e79;}
-.hm thead th.cur {opacity: 1; color: #1f4e79;}
-.hm-tot th, .hm-tot td {font-weight: 800; border-top: 2px solid rgba(127,127,127,.3); border-bottom: none;}
+.hm-wrap {overflow-x: auto; border: 1px solid rgba(127,127,127,0.2); border-radius: 10px; margin-top: 6px; font-size: .82rem;}
+.hm-in {min-width: 1080px;}
+.hm-r {display: grid; grid-template-columns: 150px repeat(12, minmax(64px, 1fr)) 70px; align-items: stretch;
+  border-bottom: 1px solid rgba(127,127,127,.12);}
+.hm-r > div {padding: 7px 8px; text-align: right; white-space: nowrap;}
+.hm-r > div:first-child {text-align: left; font-weight: 600; padding-left: 12px; overflow: hidden; text-overflow: ellipsis;}
+.hm-h > div {font-weight: 600; font-size: .78rem; opacity: .75; line-height: 1.2;} .hm-h small {font-weight: 400;}
+.hm-r .cur {box-shadow: inset 2px 0 0 #1f4e79, inset -2px 0 0 #1f4e79;}
+.hm-h .cur {opacity: 1; color: #1f4e79;}
+.hm-tot > div {font-weight: 800; border-top: 2px solid rgba(127,127,127,.3);}
 .hm-y {font-weight: 600; opacity: .8;}
+.hm details > summary {list-style: none; cursor: pointer;} .hm details > summary::-webkit-details-marker {display: none;}
+.hm details > summary > div:first-child::before {content: "▸ "; opacity: .55; font-size: .75rem;}
+.hm details[open] > summary > div:first-child::before {content: "▾ ";}
+.hm details > summary:hover {background: rgba(31,78,121,.04);}
+.hm-sub > div {font-size: .78rem;} .hm-sub > div:first-child {font-weight: 500; padding-left: 30px; opacity: .85;}
+.hm-sub {background: rgba(127,127,127,.035);}
 .tg-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 6px 0 4px 0;}
 .tg-card {border: 1px solid rgba(127,127,127,0.2); border-left: 5px solid #b0b7c3; border-radius: 10px;
   padding: 10px 12px 9px 12px; background: rgba(127,127,127,0.04);}
@@ -2072,40 +2080,70 @@ def render_home(ctx):
         month_heatmap(fcs, cur, ctx)
 
 
+# 월 매출표에서 클릭하면 브랜드별로 펼쳐 볼 상품군
+BRAND_SPLIT_GROUPS = ["강아지 기저귀"]
+
+
+def brand_of(name: str) -> str:
+    """품명 맨 앞 브랜드 (코멧/탐사/홈플래닛...). 없으면 '기타'."""
+    t = re.sub(r"^Box_", "", str(name).strip())
+    first = t.split()[0] if t.split() else ""
+    return first if first in BRANDS else "기타"
+
+
 def month_heatmap(fcs, cur, ctx, n=12):
-    """상품군 × 최근 12개월 매출표. 칸 색이 진할수록 그 상품군 안에서 매출이 큰 달 (시즌 패턴 확인용)."""
+    """상품군 × 최근 12개월 매출표. 칸 색이 진할수록 그 행 안에서 매출이 큰 달 (시즌 패턴 확인용).
+    브랜드가 2개 이상인 상품군은 클릭하면 브랜드별(코멧/탐사 등) 행이 펼쳐진다."""
     vat = ctx["vat_incl"]
     months = [add_months(cur[0], cur[1], i) for i in range(-(n - 1), 1)]
-    groups = gsort(f["group"] for f in fcs)
-    data = {g: [month_tot([f for f in fcs if f["group"] == g], mm, vat) for mm in months] for g in groups}
-    data = {g: v for g, v in data.items() if any(v)}
+    mt = lambda fs: [month_tot(fs, mm, vat) for mm in months]
+    groups = [g for g in gsort(f["group"] for f in fcs)]
+    data = {g: [f for f in fcs if f["group"] == g] for g in groups}
+    data = {g: fs for g, fs in data.items() if any(mt(fs))}
     if not data:
         return
-    total = [sum(v[i] for v in data.values()) for i in range(len(months))]
-    ly = {g: month_tot([f for f in fcs if f["group"] == g], (cur[0] - 1, cur[1]), vat, "실적") for g in data}
+    ly_m = (cur[0] - 1, cur[1])
 
-    def row(name, vals, ly_v, bold=False):
+    def cells(name, vals, ly_v, cls=""):
         mx = max(vals) or 1
-        tds = []
+        out = [f"<div title='{html.escape(name)}'>{html.escape(name)}</div>"]
         for k_, v in enumerate(vals):
             a_ = 0.06 + 0.6 * (v / mx) if v else 0
             fg = "#fff" if v / mx > 0.62 else "inherit"
-            cur_ = " cur" if k_ == len(vals) - 1 else ""
-            tds.append(f"<td class='hm-c{cur_}' style='background:rgba(31,78,121,{a_:.2f});color:{fg}'>"
-                       f"{won_s(v) if v >= 0.5 else '·'}</td>")
-        yoy = (f"{(vals[-1] / ly_v - 1) * 100:+.0f}%" if ly_v else "-")
-        cls = " class='hm-tot'" if bold else ""
-        return f"<tr{cls}><th>{html.escape(name)}</th>{''.join(tds)}<td class='hm-y'>{yoy}</td></tr>"
+            cur_ = " class='cur'" if k_ == len(vals) - 1 else ""
+            out.append(f"<div{cur_} style='background:rgba(31,78,121,{a_:.2f});color:{fg}'>{won_s(v) if v >= 0.5 else '·'}</div>")
+        out.append(f"<div class='hm-y'>{(vals[-1] / ly_v - 1) * 100:+.0f}%</div>" if ly_v else "<div class='hm-y'>-</div>")
+        return f"<div class='hm-r {cls}'>{''.join(out)}</div>", "".join(out)
 
-    head = "".join(f"<th class='{'cur' if k_ == len(months) - 1 else ''}'>{mm[1]}월" + ("<br><small>(예상)</small>" if k_ == len(months) - 1 else
-                   (f"<br><small>{mm[0] % 100}년</small>" if mm[1] == 1 or k_ == 0 else "")) + "</th>"
-                   for k_, mm in enumerate(months))
-    body = "".join(row(g, v, ly[g]) for g, v in data.items())
-    body += row("합계", total, sum(ly.values()), bold=True)
+    head = ["<div></div>"] + [
+        f"<div class='{'cur' if k_ == len(months) - 1 else ''}'>{mm[1]}월"
+        + ("<br><small>(예상)</small>" if k_ == len(months) - 1 else (f"<br><small>{mm[0] % 100}년</small>" if mm[1] == 1 or k_ == 0 else ""))
+        + "</div>" for k_, mm in enumerate(months)] + ["<div>전년비</div>"]
+    rows = [f"<div class='hm-r hm-h'>{''.join(head)}</div>"]
+    for g, fs in data.items():
+        row_html, inner = cells(g, mt(fs), month_tot(fs, ly_m, vat, "실적"))
+        brands = gsort_brands({brand_of(f["name"]) for f in fs if not f.get("manual")})
+        if g in BRAND_SPLIT_GROUPS and len(brands) >= 2:
+            subs = []
+            for b in brands:
+                bf = [f for f in fs if not f.get("manual") and brand_of(f["name"]) == b]
+                v = mt(bf)
+                if any(v):
+                    subs.append(cells(f"{b} ({len(bf)})", v, month_tot(bf, ly_m, vat, "실적"), "hm-sub")[0])
+            rows.append(f"<details><summary class='hm-r'>{inner}</summary>{''.join(subs)}</details>")
+        else:
+            rows.append(row_html)
+    total = [sum(x) for x in zip(*(mt(fs) for fs in data.values()))]
+    rows.append(cells("합계", total, sum(month_tot(fs, ly_m, vat, "실적") for fs in data.values()), "hm-tot")[0])
     sec(f"📅 상품군별 월 매출 (최근 {n}개월)",
-        "색이 진할수록 그 상품군 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측 · 오른쪽 = 이번 달 전년 동월 대비")
-    st.markdown(f"<div class='hm-wrap'><table class='hm'><thead><tr><th></th>{head}<th>전년비</th></tr></thead>"
-                f"<tbody>{body}</tbody></table></div>", unsafe_allow_html=True)
+        "▸ 강아지 기저귀는 클릭하면 브랜드별(코멧/탐사)로 펼쳐집니다 · 색이 진할수록 그 행 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측")
+    st.markdown(f"<div class='hm-wrap'><div class='hm hm-in'>{''.join(rows)}</div></div>",
+                unsafe_allow_html=True)
+
+
+def gsort_brands(bs) -> list:
+    order = {b: i for i, b in enumerate(BRANDS)}
+    return sorted(bs, key=lambda b: (b == "기타", order.get(b, 99), b))
 
 
 # ─────────────────────────────── 공장 발주 시뮬레이터 ───────────────────────────────
