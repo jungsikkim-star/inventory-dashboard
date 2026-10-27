@@ -1091,6 +1091,19 @@ CSS = """
 .hm details > summary:hover {background: rgba(31,78,121,.04);}
 .hm-sub > div {font-size: .78rem;} .hm-sub > div:first-child {font-weight: 500; padding-left: 30px; opacity: .85;}
 .hm-sub {background: rgba(127,127,127,.035);}
+.sim-grid {display: grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 10px; margin-top: 6px;}
+.sim-card {border: 1px solid rgba(127,127,127,0.2); border-radius: 12px; padding: 12px 14px; background: rgba(127,127,127,0.04);}
+.sim-card.good {border-left: 5px solid #2a9d8f;} .sim-card.part {border-left: 5px solid #e9b949;} .sim-card.bad {border-left: 5px solid #e76f51;}
+.sim-h {font-weight: 700; font-size: .95rem; line-height: 1.3;}
+.sim-q {font-size: .78rem; opacity: .7; margin: 2px 0 8px 0;}
+.sim-st {display: flex; align-items: center; gap: 6px; font-size: .82rem; margin-bottom: 8px; flex-wrap: wrap;}
+.sim-st .ar {opacity: .45;} .sim-st span.b {padding: 2px 8px; border-radius: 10px; background: rgba(127,127,127,.1); white-space: nowrap;}
+.sim-row {display: flex; justify-content: space-between; gap: 8px; font-size: .82rem; padding: 3px 0; border-top: 1px dashed rgba(127,127,127,.18);}
+.sim-row .k {opacity: .68;} .sim-row .v {font-weight: 600; text-align: right;} .sim-row .v small {font-weight: 400; opacity: .75;}
+.pos {color: #1f7a6f;} .neg {color: #b2482d;}
+.sim-warn {font-size: .74rem; color: #9a5a1c; background: rgba(244,162,97,.15); border-radius: 6px; padding: 3px 7px; margin-top: 6px;}
+.ref-row {display: flex; justify-content: space-between; gap: 8px; font-size: .8rem; padding: 5px 0; border-bottom: 1px solid rgba(127,127,127,.12);}
+.ref-row .n {font-weight: 600;} .ref-row .m {opacity: .7; white-space: nowrap; text-align: right;}
 .tg-grid {display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 6px 0 4px 0;}
 .tg-card {border: 1px solid rgba(127,127,127,0.2); border-left: 5px solid #b0b7c3; border-radius: 10px;
   padding: 10px 12px 9px 12px; background: rgba(127,127,127,0.04);}
@@ -2166,60 +2179,117 @@ def gsort_brands(bs) -> list:
 
 
 # ─────────────────────────────── 공장 발주 시뮬레이터 ───────────────────────────────
-def scenario_metrics(fs, base, vat, month):
+def scenario_metrics(fs, base, vat, month, first_arrival=None, until=None):
+    """until: 이 날짜 전까지만 집계 (다음 발주분이 들어올 수 있는 날까지 = 이번 발주의 책임 구간)"""
     k = 1.0 if vat else 1 / 1.1
-    fut = [e for f in fs for e in f["events"] if e["date"] > base]
+    fut = [e for f in fs for e in f["events"] if e["date"] > base and (until is None or e["date"] < until)]
+    lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] * k for e in es)
     return dict(
+        loss_pre=lost([e for e in fut if first_arrival and e["date"] < first_arrival]),
         rev=sum(ev_rev(e, vat) for e in fut),
         rev_m=sum(ev_rev(e, vat) for e in fut if mkey(e["date"]) == month),
         loss=sum((e["demand"] - e["deliv"]) * e["price"] * k for e in fut),
         risk=sum(e.get("risk", 0) * e["price"] * k for e in fut if e["kind"] == "확정"))
 
 
+def _sim_card(nm, lst, it, sim0, sim1, ev0, ev1, m0, m1, has_po, base, cur, warn, w_end) -> str:
+    esc = html.escape
+    n0, n1 = sum(sim0["out"][:w_end]), sum(sim1["out"][:w_end])
+    runs1 = _runs(sim1["out"][:w_end])
+    md = lambda i: (base + timedelta(days=i)).strftime("%m/%d")
+    rec, rec_m = m1["rev"] - m0["rev"], m1["rev_m"] - m0["rev_m"]
+    risk_fix, left, pre = m0["risk"] - m1["risk"], m1["loss"], m1["loss_pre"]
+    arr_i = (min(a for a, _, _ in lst) - base).days
+    pre_runs = [(a_, min(b_, arr_i - 1)) for a_, b_ in runs1 if a_ < arr_i]
+    post_runs = [(max(a_, arr_i), b_) for a_, b_ in runs1 if b_ >= arr_i]
+    post_n = sum(b_ - a_ + 1 for a_, b_ in post_runs)
+    cls = "good" if (post_n == 0 and left - pre < 0.5) else ("part" if n1 < n0 or rec >= 0.5 else "bad")
+    qty = ", ".join(f"{q:,.0f}개 · {a:%m/%d} 입고" for a, q, _ in sorted(lst))
+    span = lambda rs: f"{md(rs[0][0])}~{md(rs[0][1])}" + (f" 외 {len(rs) - 1}회" if len(rs) > 1 else "")
+    rows = [("결품 일수", f"{n0}일 → <b>{n1}일</b>", "pos" if n1 < n0 else ("" if n1 == 0 else "neg"))]
+    if pre_runs:
+        rows.append(("입고 전 결품 (발주로 못 막음)", span(pre_runs), ""))
+    rows += [("입고 후 결품", "없음" if not post_runs else f"{span(post_runs)} ({post_n}일)", "pos" if not post_runs else "neg"),
+            ("다음 발주 데드라인", f"{ev1['deadline']:%m/%d}" if ev1["deadline"] else "당분간 없음", "")]
+    if has_po:
+        rows.append(("회복 매출", f"+{won_s(rec)}" if rec >= 0.5 else "0", "pos" if rec >= 0.5 else ""))
+        if rec_m >= 0.5:
+            rows.append((f"{cur[1]}월 매출 증가", f"+{won_s(rec_m)}", "pos"))
+        if risk_fix >= 0.5:
+            rows.append(("확정 PO 납품 위험 해소", f"+{won_s(risk_fix)}", "pos"))
+        rows.append(("그래도 남는 손실", (won_s(left) + (f" <small>(입고 전 {won_s(pre)})</small>" if pre >= 0.5 else ""))
+                     if left >= 0.5 else "없음", "neg" if left - pre >= 0.5 else ("" if left >= 0.5 else "pos")))
+    else:
+        rows.append(("매출 변화", "쿠팡PO 매칭 없음", ""))
+    body = "".join(f"<div class='sim-row'><span class='k'>{k_}</span><span class='v {c_}'>{v_}</span></div>" for k_, v_, c_ in rows)
+    qty += f" · {md(w_end)} 전까지 기준" if w_end < len(sim0["out"]) else ""
+    return (f"<div class='sim-card {cls}'><div class='sim-h'>{esc(disp(nm))}</div><div class='sim-q'>{esc(qty)}</div>"
+            f"<div class='sim-st'><span class='b'>{esc(badge(ev0))}</span><span class='ar'>→</span><span class='b'>{esc(badge(ev1))}</span></div>"
+            f"{body}" + "".join(f"<div class='sim-warn'>{esc(w)}</div>" for w in warn) + "</div>")
+
+
 def render_simulator(ctx):
     base, items, inv = ctx["base"], ctx["items"], ctx["inv_df"]
     byname = {i.name: i for i in items}
+    by_disp = {disp(n): n for n in byname}
     vat, cfg = ctx["vat_incl"], ctx["po_cfg"]
     cur = (base.year, base.month)
-    sec("🏭 공장 발주 시뮬레이터",
-        "발주할 품목·수량·입고일을 넣으면 결품일, 발주 상태, 회복되는 매출이 바로 계산됩니다. 여러 품목을 한꺼번에 넣을 수 있습니다.")
+    esc = html.escape
+    sec("🏭 공장 발주 시뮬레이터", "발주 수량과 입고일을 넣어 보면, 결품이 해소되는지와 매출이 얼마나 살아나는지 바로 비교합니다.")
 
-    need = inv[inv["_tier"].isin([0, 1, 2, 3])].head(5)
-    seed = [{"품목": r["품명"], "발주일": base, "입고일": None,
-             "수량": int(r["권장 발주량"] or byname[r["품명"]].moq)} for _, r in need.iterrows()]
-    if not seed:
-        it0 = items[0]
-        seed = [{"품목": it0.name, "발주일": base, "입고일": None, "수량": int(it0.moq)}]
-    edited = st.data_editor(
-        pd.DataFrame(seed), num_rows="dynamic", hide_index=True, key=f"sim_{ctx['sig']}_{base}",
-        column_config={
-            "품목": st.column_config.SelectboxColumn("품목", options=sorted(byname), required=True, width="large"),
-            "발주일": st.column_config.DateColumn("발주일", format="YYYY-MM-DD"),
-            "입고일": st.column_config.DateColumn("입고일", format="YYYY-MM-DD", help="비우면 발주일 + 품목 리드타임"),
-            "수량": st.column_config.NumberColumn("수량(개)", min_value=0, step=1, format="%d")})
-    st.caption("기본값은 지금 발주가 필요한 품목과 권장 발주량입니다. 행을 추가·삭제하거나 숫자를 바꿔보세요.")
+    # ── ① 입력
+    need = inv[inv["_tier"].isin([0, 1, 2, 3])]
+    with box():
+        left, right = st.columns([3, 2])
+        with left:
+            st.markdown("**① 발주 입력**")
+            seed = [{"품목": disp(r["품명"]), "수량": int(r["권장 발주량"] or byname[r["품명"]].moq), "발주일": base, "입고일": None}
+                    for _, r in need.head(5).iterrows()]
+            if not seed:
+                seed = [{"품목": disp(items[0].name), "수량": int(items[0].moq), "발주일": base, "입고일": None}]
+            edited = st.data_editor(
+                pd.DataFrame(seed), num_rows="dynamic", hide_index=True, key=f"sim_{ctx['sig']}_{base}",
+                column_config={
+                    "품목": st.column_config.SelectboxColumn("품목", options=sorted(by_disp), required=True, width="medium"),
+                    "수량": st.column_config.NumberColumn("수량(개)", min_value=0, step=1, format="%d"),
+                    "발주일": st.column_config.DateColumn("발주일", format="MM/DD"),
+                    "입고일": st.column_config.DateColumn("입고일", format="MM/DD", help="비우면 발주일 + 리드타임으로 계산")})
+            st.caption("처음에는 지금 발주가 필요한 품목과 권장 발주량이 채워져 있어요. 행 추가·삭제·수정 가능 · 입고일을 비우면 리드타임으로 자동 계산")
+        with right:
+            st.markdown("**참고: 지금 발주가 필요한 품목**")
+            if len(need):
+                ref = []
+                for _, r in need.iterrows():
+                    it = byname[r["품명"]]
+                    q = f"{r['권장 발주량']:,.0f}개" if pd.notna(r["권장 발주량"]) else "-"
+                    ref.append(f"<div class='ref-row'><span class='n'>{esc(r['상태'][:1])} {esc(disp(r['품명']))}</span>"
+                               f"<span class='m'>권장 {q} · L/T {it.lt}일 · MOQ {('전량' if it.moq_all else f'{it.moq:,.0f}')}</span></div>")
+                st.markdown("<div class='hl' style='max-height:260px'>" + "".join(ref) + "</div>", unsafe_allow_html=True)
+            else:
+                st.caption("14일 안에 발주가 필요한 품목이 없어요.")
 
-    orders, warns = {}, []
+    orders, warns = {}, {}
     for _, r in edited.iterrows():
-        nm, q = r.get("품목"), to_num(r.get("수량"))
-        if not isinstance(nm, str) or nm not in byname or not q or q <= 0:
+        nm, q = by_disp.get(r.get("품목")), to_num(r.get("수량"))
+        if not nm or not q or q <= 0:
             continue
         it = byname[nm]
         od = as_date(r.get("발주일")) or base
         ar = as_date(r.get("입고일")) or od + timedelta(days=it.lt)
-        if ar < od + timedelta(days=it.lt):
-            warns.append(f"{nm}: 입고일 {ar:%m/%d}이 리드타임({it.lt}일) 기준 가장 빠른 입고일({od + timedelta(days=it.lt):%m/%d})보다 빠릅니다.")
         if ar < base:
-            warns.append(f"{nm}: 입고일이 기준일보다 앞이라 제외했습니다.")
+            st.warning(f"{disp(nm)}: 입고일이 기준일보다 앞이라 제외했어요.")
             continue
+        if ar < od + timedelta(days=it.lt):
+            warns.setdefault(nm, []).append(f"입고일 {ar:%m/%d}이 리드타임({it.lt}일) 기준 가장 빠른 날({od + timedelta(days=it.lt):%m/%d})보다 빨라요")
+        if not it.moq_all and it.moq > 0 and q % it.moq:
+            warns.setdefault(nm, []).append(f"수량이 MOQ {it.moq:,.0f}개의 배수가 아니에요")
         orders.setdefault(nm, []).append((ar, q, od))
-    for w in warns:
-        st.warning(w)
     if not orders:
-        st.info("품목과 수량을 입력하면 결과가 나옵니다.")
+        st.info("품목과 수량을 입력하면 결과가 나와요.")
         return
 
-    res, detail = [], {}
+    res, detail, cards = [], {}, []
+    tot = dict(rec=0.0, rec_m=0.0, risk=0.0, left=0.0, qty=0.0, pre=0.0, n0=0, n1=0)
     for nm, lst in orders.items():
         it = byname[nm]
         it2 = dataclasses.replace(it, inbound=sorted(it.inbound + [(a, q, False) for a, q, _ in lst]))
@@ -2228,57 +2298,91 @@ def render_simulator(ctx):
         ev1 = evaluate(it2, sim1, base, it.adu, it.safety, it.lt, ctx["target_days"])
         f0 = [f for f in ctx["fcs"] if f["item"] is not None and f["item"].name == nm]
         f1 = [forecast_po(f["name"], ctx["po_by_name"][f["name"]], base, ctx["horizon_end"], it2, cfg) for f in f0]
-        m0, m1 = scenario_metrics(f0, base, vat, cur), scenario_metrics(f1, base, vat, cur)
-        so = lambda s: (base + timedelta(days=s["stockout"])) if s["stockout"] is not None else None
-        res.append({
-            "품목": disp(nm), "추가 입고": ", ".join(f"{a:%m/%d} {q:,.0f}개" for a, q, _ in sorted(lst)),
-            "상태 (전)": badge(ev0), "상태 (후)": badge(ev1),
-            "평택 결품일 (전)": so(sim0), "평택 결품일 (후)": so(sim1),
-            "다음 발주 데드라인 (후)": ev1["deadline"],
-            "회복 매출": int(m1["rev"] - m0["rev"]), f"{cur[1]}월 매출 증가": int(m1["rev_m"] - m0["rev_m"]),
-            "확정 PO 위험 해소": int(m0["risk"] - m1["risk"]), "남은 재고부족 손실": int(m1["loss"]),
-            "PO 매칭": "O" if f0 else "X",
-        })
-        detail[nm] = (it, it2, sim0, sim1, f0, f1)
-    rdf = pd.DataFrame(res)
+        first_arr = min(a for a, _, _ in lst)
+        # 비교 구간: 다음 발주분이 들어올 수 있는 날(다음 데드라인 + 리드타임) 전까지. 그 뒤 결품은 '다음 발주를 안 해서' 생기는 것
+        w_end = len(sim0["out"])
+        if ev1["deadline"]:
+            w_end = min(w_end, max((ev1["deadline"] - base).days + it.lt, (max(a for a, _, _ in lst) - base).days + 1))
+        until = base + timedelta(days=w_end)
+        m0 = scenario_metrics(f0, base, vat, cur, first_arr, until)
+        m1 = scenario_metrics(f1, base, vat, cur, first_arr, until)
+        cards.append(_sim_card(nm, lst, it, sim0, sim1, ev0, ev1, m0, m1, bool(f0), base, cur, warns.get(nm, []), w_end))
+        tot["rec"] += m1["rev"] - m0["rev"]
+        tot["rec_m"] += m1["rev_m"] - m0["rev_m"]
+        tot["risk"] += m0["risk"] - m1["risk"]
+        tot["left"] += m1["loss"]
+        tot["pre"] += m1["loss_pre"]
+        tot["n0"] += sum(sim0["out"][:w_end])
+        tot["n1"] += sum(sim1["out"][:w_end])
+        tot["qty"] += sum(q for _, q, _ in lst)
+        so = lambda sm: (base + timedelta(days=sm["stockout"])) if sm["stockout"] is not None else None
+        res.append({"품목": disp(nm), "추가 입고": ", ".join(f"{a:%m/%d} {q:,.0f}개" for a, q, _ in sorted(lst)),
+                    "상태 (전)": badge(ev0), "상태 (후)": badge(ev1), "평택 결품일 (전)": so(sim0), "평택 결품일 (후)": so(sim1),
+                    "다음 발주 데드라인": ev1["deadline"], "회복 매출": m1["rev"] - m0["rev"],
+                    f"{cur[1]}월 매출 증가": m1["rev_m"] - m0["rev_m"], "확정 PO 위험 해소": m0["risk"] - m1["risk"],
+                    "남는 손실": m1["loss"]})
+        detail[nm] = (it, sim0, sim1, f0, f1)
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("📈 회복 매출 (예측 기간)", won(rdf["회복 매출"].sum()), help=f"~{ctx['horizon_end']:%Y-%m}")
-    k2.metric(f"📅 {cur[1]}월 매출 증가", won(rdf[f"{cur[1]}월 매출 증가"].sum()))
-    k3.metric("🚚 확정 PO 위험 해소", won(rdf["확정 PO 위험 해소"].sum()))
-    k4.metric("⛔ 그래도 남는 손실", won(rdf["남은 재고부족 손실"].sum()))
+    # ── ② 요약
+    st.write("")
+    st.markdown("**② 결과 요약**")
     if not cfg["cap"]:
-        st.info("사이드바에서 '재고 제약 반영'이 꺼져 있어 매출 변화가 0으로 나옵니다. 켜고 보세요.")
-    ccfg = {c_: num_col(c_) for c_ in ("회복 매출", f"{cur[1]}월 매출 증가", "확정 PO 위험 해소", "남은 재고부족 손실")}
-    ccfg.update({c_: date_col(c_) for c_ in ("평택 결품일 (전)", "평택 결품일 (후)", "다음 발주 데드라인 (후)")})
-    wide(st.dataframe, rdf, hide_index=True, column_config=ccfg)
-    st.caption("회복 매출 = 추가 입고 덕분에 납품 가능해지는 예측 PO 금액. PO 매칭 X = 쿠팡PO 탭과 연결이 안 돼 매출 변화를 계산할 수 없는 품목.")
+        st.info("사이드바 '재고 제약 반영'이 꺼져 있으면 매출 변화가 0으로 나와요. 켜고 보세요.")
+    kpis = [("발주 합계", f"{tot['qty']:,.0f}개", f"{len(orders)}개 품목", ""),
+            ("회복 매출", f"+{won_s(tot['rec'])}" if tot["rec"] >= 0.5 else "0", "이 발주로 납품 가능해지는 쿠팡 PO", "good" if tot["rec"] >= 0.5 else ""),
+            ("결품 일수 합계", f"{tot['n0']:,}일 → {tot['n1']:,}일", "품목별 결품인 날을 더한 값",
+             "good" if tot["n1"] < tot["n0"] else ""),
+            ("그래도 남는 손실", won_s(tot["left"]) if tot["left"] >= 0.5 else "없음",
+             (f"그중 {won_s(tot['pre'])}은 입고 전이라 이 발주로는 못 막는 부분" if tot["pre"] >= 0.5 else "수량을 늘려 보세요")
+             if tot["left"] >= 0.5 else "이 발주로 재고 부족 손실이 모두 해소돼요",
+             "bad" if tot["left"] - tot["pre"] >= 0.5 else ("" if tot["left"] >= 0.5 else "good"))]
+    st.markdown("<div class='kpi-grid'>" + "".join(
+        f"<div class='kpi'><div class='l'>{l_}</div><div class='v'>{v_}</div><div class='s {c_}'>{s_}</div></div>"
+        for l_, v_, s_, c_ in kpis) + "</div>", unsafe_allow_html=True)
 
-    pick = st.selectbox("그래프로 볼 품목", list(detail), key="sim_pick", format_func=disp)
-    it, it2, sim0, sim1, f0, f1 = detail[pick]
+    # ── ③ 품목별
+    st.write("")
+    st.markdown("**③ 품목별 결과** · 왼쪽 색: 🟢 입고 후 결품 없음 / 🟡 일부 개선 / 🔴 변화 없음")
+    st.caption("비교 구간은 품목마다 '다음 발주분이 들어올 수 있는 날' 전까지예요. 그 뒤 결품은 이번 발주가 아니라 다음 발주에서 막아야 하는 부분이라 빼고 계산해요.")
+    st.markdown("<div class='sim-grid'>" + "".join(cards) + "</div>", unsafe_allow_html=True)
+    with st.expander("표로 보기"):
+        rdf = pd.DataFrame(res)
+        ccfg = {c_: num_col(c_) for c_ in ("회복 매출", f"{cur[1]}월 매출 증가", "확정 PO 위험 해소", "남는 손실")}
+        ccfg.update({c_: date_col(c_) for c_ in ("평택 결품일 (전)", "평택 결품일 (후)", "다음 발주 데드라인")})
+        wide(st.dataframe, rdf, hide_index=True, column_config=ccfg)
+
+    # ── ④ 그래프
+    st.write("")
+    st.markdown("**④ 그래프로 비교**")
+    pick = st.selectbox("품목", list(detail), key="sim_pick", format_func=disp, label_visibility="collapsed")
+    it, sim0, sim1, f0, f1 = detail[pick]
     l, r = st.columns(2)
     n = 120
     days = [base + timedelta(days=i) for i in range(n)]
     with l:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=days, y=sim0["main"][:n], name="발주 전", line=dict(color=C["before"], width=2, dash="dash")))
-        fig.add_trace(go.Scatter(x=days, y=sim1["main"][:n], name="발주 후", line=dict(color=C["after"], width=3)))
+        fig.add_trace(go.Scatter(x=days, y=sim1["main"][:n], name="발주 후", line=dict(color=C["after"], width=3),
+                                 fill="tozeroy", fillcolor="rgba(42,157,143,0.08)"))
         for a, q, _ in orders[pick]:
             if a < days[-1]:
                 fig.add_vline(x=a.isoformat(), line_dash="dot", line_color=C["after"])
+                fig.add_annotation(x=a.isoformat(), y=1, yref="paper", text=f"+{q:,.0f}", showarrow=False,
+                                   font=dict(size=11, color=C["after"]), yanchor="bottom")
         if it.safety > 0:
             fig.add_hline(y=it.safety, line_dash="dashdot", line_color=C["safe"], annotation_text="안전재고")
         fig.update_layout(hovermode="x unified", yaxis_title="평택 재고 (개)")
-        wide(st.plotly_chart, style_fig(fig, height=340, title="평택 재고 (발주 전 vs 후)"))
+        wide(st.plotly_chart, style_fig(fig, height=340, title="평택 재고 흐름 (발주 전 vs 후)"))
     with r:
         cm = [add_months(cur[0], cur[1], i) for i in range(FORECAST_MONTHS)]
         labels = [mtick(a_, b_) for a_, b_ in cm]
         fut = lambda fs, mm: sum(ev_rev(e, vat) for f in fs for e in f["events"] if e["date"] > base and mkey(e["date"]) == mm)
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=labels, y=[fut(f0, mm) for mm in cm], name="발주 전", marker_color=C["before"], hovertemplate="%{y:,.0f}원"))
-        fig.add_trace(go.Bar(x=labels, y=[fut(f1, mm) for mm in cm], name="발주 후", marker_color=C["after"], hovertemplate="%{y:,.0f}원"))
+        if f0:
+            fig.add_trace(go.Bar(x=labels, y=[fut(f0, mm) for mm in cm], name="발주 전", marker_color=C["before"], hovertemplate="%{y:,.0f}원"))
+            fig.add_trace(go.Bar(x=labels, y=[fut(f1, mm) for mm in cm], name="발주 후", marker_color=C["after"], hovertemplate="%{y:,.0f}원"))
         fig.update_layout(barmode="group", hovermode="x unified")
-        wide(st.plotly_chart, style_fig(fig, height=340, title="기준일 이후 월별 PO 매출 (전 vs 후)"))
+        wide(st.plotly_chart, style_fig(fig, height=340, title="월별 쿠팡 PO 매출 (발주 전 vs 후)" if f0 else "쿠팡PO 매칭이 없어 매출 비교 불가"))
 
 
 # ─────────────────────────────── 엑셀 리포트 ───────────────────────────────
