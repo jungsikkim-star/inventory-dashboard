@@ -1059,8 +1059,10 @@ CSS = """
 .hl-r {text-align: right; font-size: .8rem; white-space: nowrap; line-height: 1.35;} .hl-r small {display: block; opacity: .65;}
 .hl-date {font-size: .74rem; font-weight: 700; opacity: .6; margin: 8px 0 0 0;}
 .hm-wrap {overflow-x: auto; border: 1px solid rgba(127,127,127,0.2); border-radius: 10px; margin-top: 6px; font-size: .82rem;}
-.hm-in {min-width: 1080px;}
-.hm-r {display: grid; grid-template-columns: 150px repeat(12, minmax(64px, 1fr)) 70px; align-items: stretch;
+.hm-in {min-width: 1170px;}
+.hm-ytd {font-weight: 700; border-left: 2px solid rgba(127,127,127,.25);}
+.hm-z {opacity: .3;}
+.hm-r {display: grid; grid-template-columns: 150px repeat(12, minmax(64px, 1fr)) 64px 88px; align-items: stretch;
   border-bottom: 1px solid rgba(127,127,127,.12);}
 .hm-r > div {padding: 7px 8px; text-align: right; white-space: nowrap;}
 .hm-r > div:first-child {text-align: left; font-weight: 600; padding-left: 12px; overflow: hidden; text-overflow: ellipsis;}
@@ -2111,14 +2113,17 @@ def month_heatmap(fcs, cur, ctx, n=12):
             a_ = 0.06 + 0.6 * (v / mx) if v else 0
             fg = "#fff" if v / mx > 0.62 else "inherit"
             cur_ = " class='cur'" if k_ == len(vals) - 1 else ""
-            out.append(f"<div{cur_} style='background:rgba(31,78,121,{a_:.2f});color:{fg}'>{won_s(v) if v >= 0.5 else '·'}</div>")
+            txt = won_s(v) if v >= 0.5 else "<span class='hm-z'>-</span>"
+            out.append(f"<div{cur_} style='background:rgba(31,78,121,{a_:.2f});color:{fg}'>{txt}</div>")
         out.append(f"<div class='hm-y'>{(vals[-1] / ly_v - 1) * 100:+.0f}%</div>" if ly_v else "<div class='hm-y'>-</div>")
+        ytd = sum(v for mm, v in zip(months, vals) if mm[0] == cur[0])      # 올해 1월 ~ 이번 달(예상 포함)
+        out.append(f"<div class='hm-ytd'>{won_s(ytd) if ytd >= 0.5 else '-'}</div>")
         return f"<div class='hm-r {cls}'>{''.join(out)}</div>", "".join(out)
 
     head = ["<div></div>"] + [
         f"<div class='{'cur' if k_ == len(months) - 1 else ''}'>{mm[1]}월"
         + ("<br><small>(예상)</small>" if k_ == len(months) - 1 else (f"<br><small>{mm[0] % 100}년</small>" if mm[1] == 1 or k_ == 0 else ""))
-        + "</div>" for k_, mm in enumerate(months)] + ["<div>전년비</div>"]
+        + "</div>" for k_, mm in enumerate(months)] + ["<div>전년비</div>", f"<div class='hm-ytd'>{cur[0] % 100}년 누적<br><small>1~{cur[1]}월</small></div>"]
     rows = [f"<div class='hm-r hm-h'>{''.join(head)}</div>"]
     for g, fs in data.items():
         row_html, inner = cells(g, mt(fs), month_tot(fs, ly_m, vat, "실적"))
@@ -2136,7 +2141,7 @@ def month_heatmap(fcs, cur, ctx, n=12):
     total = [sum(x) for x in zip(*(mt(fs) for fs in data.values()))]
     rows.append(cells("합계", total, sum(month_tot(fs, ly_m, vat, "실적") for fs in data.values()), "hm-tot")[0])
     sec(f"📅 상품군별 월 매출 (최근 {n}개월)",
-        "▸ 강아지 기저귀는 클릭하면 브랜드별(코멧/탐사)로 펼쳐집니다 · 색이 진할수록 그 행 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측")
+        "▸ 강아지 기저귀는 클릭하면 브랜드별(코멧/탐사)로 펼쳐집니다 · 색이 진할수록 그 행 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측 · 맨 오른쪽 = 올해 1월부터 누적")
     st.markdown(f"<div class='hm-wrap'><div class='hm hm-in'>{''.join(rows)}</div></div>",
                 unsafe_allow_html=True)
 
