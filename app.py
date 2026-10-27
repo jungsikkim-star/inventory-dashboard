@@ -188,12 +188,18 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
     # 시트 제목('26년 9월')에서 연/월
     title = " ".join(clean_txt(raw.iat[r, c]) for r in range(min(3, n_rows)) for c in range(min(4, n_cols)))
     tm = re.search(r"(\d{2,4})년(\d{1,2})월", title)
+    nm = re.search(r"(\d{1,2})월", sheet_name)
+    title_mismatch = ""
     if tm:
         year = int(tm.group(1)) + (2000 if int(tm.group(1)) < 100 else 0)
         month = int(tm.group(2))
+        if nm and int(nm.group(1)) != month:      # 시트를 복사해 만들고 제목('26년 10월')을 안 고친 경우 → 시트 이름을 따름
+            title_mismatch = f"제목은 {month}월, 시트 이름은 {int(nm.group(1))}월"
+            new_m = int(nm.group(1))
+            year += 1 if new_m < month and month - new_m > 6 else 0
+            month = new_m
     else:
-        mm = re.search(r"(\d{1,2})월", sheet_name)
-        year, month = fallback_year, int(mm.group(1)) if mm else 0
+        year, month = fallback_year, int(nm.group(1)) if nm else 0
 
     headers = []
     for c in range(n_cols):
@@ -283,6 +289,7 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
             moq=to_num(moq_raw), moq_all=clean_txt(moq_raw) == "전량",
             vf=vf,
             main=(to_num(raw.iat[r, cols["main"]]) or 0.0) if "main" in cols else 0.0,
+            has_stock=any(to_num(raw.iat[r, cols[k]]) is not None for k in ("main", "vf") if k in cols),
             safety=(to_num(raw.iat[r, cols["safety"]]) or 0.0) if "safety" in cols else 0.0,
             sales={d: (to_num(raw.iat[r, c]) or 0.0) for d, c in date_cols.items() if d in entered},
             inbound=inbound,
@@ -290,7 +297,8 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
 
     missing = [k for k in ("moq", "vf", "main") if k not in cols]
     return dict(name=sheet_name, year=year, month=month, snapshot=snapshot, rows=rows,
-                entered=sorted(entered), inbound_cols=inbound_cols, unparsed=unparsed, missing=missing)
+                entered=sorted(entered), inbound_cols=inbound_cols, unparsed=unparsed, missing=missing,
+                has_data=bool(entered) or any(r["has_stock"] for r in rows), title_mismatch=title_mismatch)
 
 
 def is_po_sheet(raw: pd.DataFrame) -> bool:
@@ -399,7 +407,7 @@ def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
     return out
 
 
-PARSER_VERSION = 6     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+PARSER_VERSION = 7     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -501,8 +509,14 @@ def estimate_lead_times(sheets: list) -> dict:
     return out
 
 
+def data_sheets(sheets) -> list:
+    """재고·출고가 하나도 안 적힌 시트(다음 달 준비용으로 미리 만든 시트 등)는 빼고, 월 순서로 정렬."""
+    ok = [s for s in sheets if s.get("has_data", True)] or list(sheets)
+    return sorted(ok, key=lambda s: (s["year"], s["month"]))
+
+
 def build_items(sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_keyword, include_stale, use_plan=True):
-    sheets = sorted(sheets, key=lambda s: (s["year"], s["month"]))
+    sheets = data_sheets(sheets)
     latest = sheets[-1]["name"]
     entered = sorted({d for s in sheets for d in s["entered"]})
     lt_est = estimate_lead_times(sheets)
@@ -2381,6 +2395,13 @@ def build_notes(ctx):
     base, items, sheets, wb = ctx["base"], ctx["items"], ctx["sheets"], ctx["wb"]
     po_recs, po_names, mapping = ctx["po_recs"], ctx["po_names"], ctx["mapping"]
     notes = []
+    empty = [s["name"] for s in sheets if not s.get("has_data", True)]
+    if empty:
+        notes.append(f"재고·출고가 비어 있는 시트 {', '.join(empty)}는 아직 작성 전으로 보고 건너뛰었습니다. "
+                     f"재고는 '{ctx['latest']}' 시트 기준입니다.")
+    for s_ in sheets:
+        if s_.get("title_mismatch"):
+            notes.append(f"[{s_['name']}] 시트 맨 위 제목과 시트 이름의 월이 다릅니다 ({s_['title_mismatch']}). 시트 이름을 따랐습니다.")
     if ctx["overrides"]:
         notes.append(f"입고 일정 {len(ctx['overrides'])}개 컬럼을 화면에서 직접 보정했습니다 (보정한 날짜는 확정으로 계산).")
     not_yet = [(it, x) for it in items for x in it.inbound_detail if not x["ordered"]]
@@ -2513,7 +2534,7 @@ def main():
         ["🏠 홈", "💰 매출 · 쿠팡 PO", "📦 재고 · 공장 발주", "🏭 발주 시뮬레이터", "🛠️ 데이터 설정"])
 
     # ── 데이터 설정 ①: 입고 일정 보정 (품목 계산 전에 반영)
-    latest_sheet = sorted(sheets, key=lambda s_: (s_["year"], s_["month"]))[-1]
+    latest_sheet = data_sheets(sheets)[-1]
     overrides = {}
     with t_data:
         sec("🗓️ 입고 일정 보정", "엑셀에 '11월초'처럼 대략 적힌 날짜를 실제 날짜로 바꾸면 확정 날짜로 계산합니다. "
