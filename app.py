@@ -485,6 +485,7 @@ class Item:
     plan: dict             # {날짜: 수량} 기준일 이후 시트에 미리 입력된 출고(쿠팡 PO 예정)
     plan_until: object     # 예정 출고가 입력된 마지막 날짜 (없으면 None)
     sales: dict            # {날짜: 출고} 전 월 시트 합본 (PO 예측에 사용)
+    policy: str = ""       # 공급 방식: "" 일반 발주 / "supply" 공장 공급 시 수령 / "mto" PO 맞춤 생산
 
 
 def calc_adu(sales: dict, entered: list, base: date, window: int):
@@ -678,7 +679,8 @@ def _runs(flags):
     return runs
 
 
-def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: int, target_days: int) -> dict:
+def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: int, target_days: int,
+             over_days: int = 60) -> dict:
     """
     시뮬레이션 결과 → 데드라인 / 상태 / 권장 발주량.
 
@@ -690,6 +692,16 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
     ms, n = sim["main"], len(sim["main"])
     out = sim.get("out") or [False] * n
     has_demand = adu > 0 or bool(item.plan)
+    if item.policy == "mto":                      # PO 맞춤 생산: 결품·발주 판단 없이 과재고만 본다
+        cover = (item.main + item.vf) / adu if adu > 0 else None
+        if not has_demand:
+            tier, status = (4.5, f"🟣 과재고 · 출고 없는데 재고 {item.main + item.vf:,.0f}개") if item.main + item.vf > 0 else (5, "💤 출고없음")
+        elif cover is not None and cover > over_days:
+            tier, status = 4.5, f"🟣 과재고 · 재고 {cover:,.0f}일분 (기준 {over_days}일) · 초과 {item.main + item.vf - adu * over_days:,.0f}개"
+        else:
+            tier, status = 4, f"🟢 PO 맞춤 생산 · 재고 {cover:,.0f}일분" if cover is not None else "🟢 PO 맞춤 생산"
+        return dict(tier=tier, status=status, d_pol=None, d_stock=None, safety_day=None, reason="", gap="", dip="",
+                    deadline=None, rec_qty=0, rec_date=None, policy="mto")
     pre = "입고 반영 후 " if item.inbound else ""
     md = lambda i: fmt_md(base, i)
 
@@ -772,7 +784,10 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
         qty = max(0.0, max(floor - ms[i] + (sim["lost"][i] - base_lost) for i in range(A, end)))
         if not item.moq_all and item.moq > 0:
             qty = math.ceil(qty / item.moq - 1e-9) * item.moq
-    return dict(tier=tier, status=status, d_pol=d_pol, d_stock=None,
+    if item.policy == "supply":                   # 리드타임 없음: '발주' 대신 '공급 요청'
+        status = (status.replace("🚨 오늘 발주", "🚨 지금 공급 요청").replace("⚠️ 긴급", "⚠️ 공급 요청 임박")
+                  .replace("🔔 준비", "🔔 공급 요청 준비").replace("(결품 기준)", "(결품 예상일 기준)"))
+    return dict(policy=item.policy, tier=tier, status=status, d_pol=d_pol, d_stock=None,
                 safety_day=(soft[0][0] if soft else None), reason=reason, gap=gap_txt, dip=dip_txt,
                 deadline=(base + timedelta(days=d_pol)) if d_pol is not None else None, rec_qty=int(round(qty)),
                 rec_date=(base + timedelta(days=d_soft)) if d_soft is not None else None)
@@ -907,7 +922,7 @@ def forecast_po(name: str, recs: list, base: date, end: date, item, cfg: dict) -
     res["next"] = preds[0] if preds else None
 
     # 재고 제약: 평택 재고 + 발주완료 입고분 안에서만 납품 가능 (확정·예측 PO를 날짜순으로 차감)
-    if cfg["cap"] and item is not None:
+    if cfg["cap"] and item is not None and item.policy != "mto":     # PO 맞춤 생산 품목은 재고 제약 없음
         stock = item.main
         res["start_stock"] = stock
         inb = sorted((d, q) for d, q, _ in item.inbound)
@@ -1127,12 +1142,17 @@ CSS = """
 """
 
 TIER_BADGE = {0: "🔴 결품 불가피", 1: "🔴 오늘 발주", 1.5: "🟠 입고 전 결품", 2: "🟠 긴급", 3: "🟡 준비",
-              4: "🟢 여유", 5: "⚪ 출고없음"}
+              4: "🟢 여유", 4.5: "🟣 과재고", 5: "⚪ 출고없음"}
+SUPPLY_BADGE = {1: "🔴 공급 요청", 2: "🟠 공급 요청 임박", 3: "🟡 공급 요청 준비"}
 
 toggle = getattr(st, "toggle", st.checkbox)
 
 
 def badge(ev) -> str:
+    if ev.get("policy") == "supply" and ev["tier"] in SUPPLY_BADGE:
+        return SUPPLY_BADGE[ev["tier"]]
+    if ev.get("policy") == "mto" and ev["tier"] == 4:
+        return "🟢 PO 맞춤"
     if ev["tier"] == 4 and ev["d_pol"] is None and ev.get("rec_date") is None:
         return "🟢 안정"
     return TIER_BADGE.get(ev["tier"], "")
@@ -1236,6 +1256,34 @@ def disp(name) -> str:
 DEFAULT_GROUP_RULES = [("장작", "장작"), ("필터", "차량용 공기필터"), ("두부모래", "네이버 두부모래"),
                        ("필름", "모니터보호필름"), ("기저귀", "강아지 기저귀"),
                        ("냄비", "주방용품"), ("팬", "주방용품"), ("웍", "주방용품")]
+
+
+# 상품군별 공급 방식
+#   supply : 리드타임 의미 없음. 공장에서 줄 수 있을 때 받음 → 발주 데드라인 대신 '결품 예상일 전에 공급 요청'
+#   mto    : 쿠팡 PO에 맞춰 공장이 생산해 보냄 → 결품·발주 관리 안 함, 과재고만 관리 (매출 예측에 재고 제약 없음)
+#   lt     : 고정 리드타임(일). 발주→입고 이력 추정값보다 우선
+GROUP_POLICY = {
+    "장작": dict(mode="supply", note="공장 공급 가능 시 수령 (리드타임 없음)"),
+    "주방용품": dict(mode="mto", note="쿠팡 PO 맞춤 생산 → 과재고만 관리"),
+    "모니터보호필름": dict(lt=35, note="생산 3주 + 배송 2주"),
+}
+
+
+def apply_policies(items, rules):
+    out = []
+    for it in items:
+        p = GROUP_POLICY.get(group_of(it.name, rules), {})
+        kw = {}
+        if p.get("mode"):
+            kw["policy"] = p["mode"]
+        if p.get("mode") == "supply":
+            kw.update(lt=0, lt_src=f"정책: {p['note']}")
+        elif "lt" in p:
+            kw.update(lt=int(p["lt"]), lt_src=f"정책: {p['note']} = {p['lt']}일")
+        elif p.get("mode") == "mto":
+            kw.update(lt_src=f"정책: {p['note']}")
+        out.append(dataclasses.replace(it, **kw) if kw else it)
+    return out
 
 
 def gsort(groups) -> list:
@@ -1830,7 +1878,7 @@ def render_inventory(ctx):
     def inv_header(g, sub):
         t = view[view["상품군"] == g]["_tier"]
         cnt = [("🔴", int((t <= 1).sum())), ("🟠", int(t.isin([1.5, 2]).sum())), ("🟡", int((t == 3).sum())),
-               ("🟢", int((t == 4).sum())), ("⚪", int((t == 5).sum()))]
+               ("🟢", int((t == 4).sum())), ("🟣", int((t == 4.5).sum())), ("⚪", int((t == 5).sum()))]
         rec = sub["권장 발주량"].fillna(0)[t.reset_index(drop=True) <= 3].sum() if "권장 발주량" in sub else 0
         dl = sub["발주 데드라인"].dropna() if "발주 데드라인" in sub else []
         return (f"**{g}** · {len(sub)}개 · " + " ".join(f"{e} {n}" for e, n in cnt if n)
@@ -1871,14 +1919,14 @@ def render_inventory(ctx):
         with c4:
             p_safe = st.number_input("안전재고 (0=결품 기준)", 0, 10_000_000, int(it.safety), step=100, key=f"sf_{h}")
         with c5:
-            p_lt = st.number_input("리드타임 (일)", 1, 120, int(it.lt), key=f"lt_{h}")
+            p_lt = st.number_input("리드타임 (일)", 0, 120, int(it.lt), key=f"lt_{h}")
         with c6:
             p_tr = st.number_input("평택→VF 이동일", 0, 14, int(ctx["transfer_days"]), key=f"tr_{h}") if not it.is_milkrun else 0
         st.caption(f"L/T 근거: {it.lt_src} · 출고평균 {it.adu_days}일 기준"
                    + (f" · {it.plan_until:%m/%d}까지는 시트 입력 예정 출고 사용" if it.plan_until else ""))
 
     sim = simulate(it, base, p_adu, trig_mode, p_trig, p_mult, p_tr, log=True)
-    ev = evaluate(it, sim, base, p_adu, p_safe, p_lt, ctx["target_days"])
+    ev = evaluate(it, sim, base, p_adu, p_safe, p_lt, ctx["target_days"], ctx["over_days"])
     with box():
         st.markdown(f"**{badge(ev)}** · {ev['status']}")
         m1, m2, m3, m4 = st.columns(4)
@@ -2048,7 +2096,9 @@ def render_home(ctx):
             amt = sum(e["risk"] * e["price"] * k for e in es)
             c_rows.append(("#e76f51", disp(f["name"]), "확정 PO 재고 없음",
                            f"{es[0]['date']:%m/%d}부터 {sum(e['risk'] for e in es):,.0f}개 모자람 ({won_s(amt)})"))
-    c_label = f"🚚 **입고 · 납품 점검** · {len(c_rows)}건" if c_rows else "🚚 **입고 · 납품 점검** · 없음"
+    for _, r in inv[inv["_tier"] == 4.5].iterrows():
+        c_rows.append(("#8e6bbf", disp(r["품명"]), "과재고", r["상세"].replace("🟣 과재고 · ", "")))
+    c_label = f"🚚 **입고 · 재고 점검** · {len(c_rows)}건" if c_rows else "🚚 **입고 · 재고 점검** · 없음"
 
     # ── 3) 쿠팡 PO 일정
     late = [f for f in fcs if f["overdue"]]
@@ -2089,7 +2139,7 @@ def render_home(ctx):
     with b:
         with st.expander(c_label, expanded=False):
             if c_rows:
-                st.caption("신규 발주가 아니라 입고·출고 일정 조정이 필요한 것")
+                st.caption("신규 발주가 아니라 입고·출고 일정 조정이나 재고 정리가 필요한 것")
                 st.markdown("<div class='hl'>" + "".join(
                     f"<div class='hl-row'><span class='hl-dot' style='background:{c_}'></span><div class='hl-main'>"
                     f"<div class='hl-name'>{esc(n_)}</div><div class='hl-sub'><b>{esc(t_)}</b> · {esc(d_)}</div></div></div>"
@@ -2263,7 +2313,7 @@ def render_simulator(ctx):
                     it = byname[r["품명"]]
                     q = f"{r['권장 발주량']:,.0f}개" if pd.notna(r["권장 발주량"]) else "-"
                     ref.append(f"<div class='ref-row'><span class='n'>{esc(r['상태'][:1])} {esc(disp(r['품명']))}</span>"
-                               f"<span class='m'>권장 {q} · L/T {it.lt}일 · MOQ {('전량' if it.moq_all else f'{it.moq:,.0f}')}</span></div>")
+                               f"<span class='m'>권장 {q} · {('공급 시 수령' if it.policy == 'supply' else f'L/T {it.lt}일')} · MOQ {('전량' if it.moq_all else f'{it.moq:,.0f}')}</span></div>")
                 st.markdown("<div class='hl' style='max-height:260px'>" + "".join(ref) + "</div>", unsafe_allow_html=True)
             else:
                 st.caption("14일 안에 발주가 필요한 품목이 없어요.")
@@ -2295,7 +2345,7 @@ def render_simulator(ctx):
         it2 = dataclasses.replace(it, inbound=sorted(it.inbound + [(a, q, False) for a, q, _ in lst]))
         sim0, ev0 = ctx["calc"][nm]
         sim1 = simulate(it2, base, it.adu, ctx["trig_mode"], ctx["trig_value"], ctx["po_mult"], ctx["transfer_days"])
-        ev1 = evaluate(it2, sim1, base, it.adu, it.safety, it.lt, ctx["target_days"])
+        ev1 = evaluate(it2, sim1, base, it.adu, it.safety, it.lt, ctx["target_days"], ctx["over_days"])
         f0 = [f for f in ctx["fcs"] if f["item"] is not None and f["item"].name == nm]
         f1 = [forecast_po(f["name"], ctx["po_by_name"][f["name"]], base, ctx["horizon_end"], it2, cfg) for f in f0]
         first_arr = min(a for a, _, _ in lst)
@@ -2499,6 +2549,8 @@ def build_notes(ctx):
     base, items, sheets, wb = ctx["base"], ctx["items"], ctx["sheets"], ctx["wb"]
     po_recs, po_names, mapping = ctx["po_recs"], ctx["po_names"], ctx["mapping"]
     notes = []
+    pol = [f"{g}: {p['note']}" for g, p in GROUP_POLICY.items()]
+    notes.append("상품군별 공급 방식 적용 → " + " / ".join(pol))
     empty = [s["name"] for s in sheets if not s.get("has_data", True)]
     if empty:
         notes.append(f"재고·출고가 비어 있는 시트 {', '.join(empty)}는 아직 작성 전으로 보고 건너뛰었습니다. "
@@ -2620,6 +2672,7 @@ def main():
         po_mult = st.selectbox("쿠팡 PO 배수", [1, 2, 3], format_func=lambda x: f"MOQ × {x}")
         transfer_days = st.number_input("평택→VF 이동 소요일", 0, 14, 0)
         target_days = st.number_input("권장 발주량 산정 기간 (일)", 7, 120, 45)
+        over_days = st.number_input("과재고 기준 (재고커버 일수, PO 맞춤 생산 품목)", 14, 365, 60)
         use_plan = st.checkbox("시트에 미리 입력된 미래 출고 반영", True)
         include_stale = st.checkbox("최신 월 시트에 없는 품목도 포함", False)
     with st.sidebar.expander("⚙️ 고급 설정 · PO 예측"):
@@ -2698,6 +2751,7 @@ def main():
                  if clean_txt(r_["키워드"]) and clean_txt(r_["상품군"])]
     st.session_state["_group_order"] = list(dict.fromkeys(g for _, g in rules))
 
+    items = apply_policies(items, rules)
     hy, hm = add_months(base.year, base.month, FORECAST_MONTHS - 1)
     horizon_end = month_end(hy, hm)
     po_cfg = dict(mode="sheet" if po_mode_label.startswith("VF") else "po", win_sheet=int(po_win_sheet),
@@ -2749,7 +2803,7 @@ def main():
     calc = {}
     for it in items:
         sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
-        calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days))
+        calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days, over_days))
 
     set_short_names({i.name for i in items} | {f["name"] for f in fcs})
     po_by_name = {}
@@ -2757,7 +2811,7 @@ def main():
         po_by_name.setdefault(r["name"], []).append(r)
     ctx = dict(base=base, items=items, calc=calc, fcs=fcs, vat_incl=vat_incl, po_cfg=po_cfg, horizon_end=horizon_end,
                targets=targets, item_group=item_group, next_po=next_po, sig=sig, trig_mode=trig_mode,
-               trig_value=trig_value, po_mult=po_mult, transfer_days=transfer_days, target_days=target_days,
+               trig_value=trig_value, po_mult=po_mult, transfer_days=transfer_days, target_days=target_days, over_days=over_days,
                po_by_name=po_by_name, deadlines={n: c_[1] for n, c_ in calc.items()},
                months=months_span(fcs, base, horizon_end) if fcs else [], stale_days=stale,
                sheets=sheets, wb=wb, po_recs=po_recs, po_names=po_names, mapping=mapping, overrides=overrides,
