@@ -2360,7 +2360,7 @@ def render_purchase_tab(ctx):
                     unknown += v
         return rev, cogs, unknown, qty
 
-    stock_val = lambda its: sum((i.main + i.vf) * ucost[i.name] for i in its if i.name in ucost)
+    stock_val = lambda its: sum(i.main * ucost[i.name] for i in its if i.name in ucost)      # 평택 재고만
     item_grp = ctx["item_group"]
 
     # ── KPI
@@ -2378,7 +2378,7 @@ def render_purchase_tab(ctx):
         ("매출총이익 (원가 아는 품목)", won_s(gp) if known else "-",
          f"마진율 {gp / known:.0%} · 원가 미확인 매출 {won_s(unknown)}" if known else "매입 단가가 있는 품목의 매출이 없어요",
          "good" if known and gp > 0 else ("bad" if known else "")),
-        ("현재 재고 금액", won_s(sv) if sv else "-", "평택+VF 재고 × 평균 매입단가 · 돈이 묶여 있는 규모", ""),
+        ("평택 재고 금액", won_s(sv) if sv else "-", "평택 재고 × 평균 매입단가 · 돈이 묶여 있는 규모", ""),
     ]
     st.markdown("<div class='kpi-grid'>" + "".join(
         f"<div class='kpi'><div class='l'>{l_}</div><div class='v'>{v_}</div><div class='s {c_}'>{s_}</div></div>"
@@ -2413,11 +2413,11 @@ def render_purchase_tab(ctx):
         rows.append({"상품군": g, "매입수량": sum(r["qty"] for r in pg) or None, "매입액": sum(r["amount"] for r in pg),
                      "매출액": rv, "매출원가": cg if kn else None, "매출총이익": (kn - cg) if kn else None,
                      "마진율": round((kn - cg) / kn * 100) if kn else None, "원가 미확인 매출": un or None,
-                     "재고 금액": stock_val(its) or None})
+                     "평택 재고 금액": stock_val(its) or None})
     if rows:
         wide(st.dataframe, pd.DataFrame(rows), hide_index=True,
              column_config={**{c_: num_col(c_) for c_ in ("매입수량", "매입액", "매출액", "매출원가", "매출총이익",
-                                                          "원가 미확인 매출", "재고 금액")},
+                                                          "원가 미확인 매출", "평택 재고 금액")},
                             "마진율": pct_col("마진율", 100)})
 
     # ── 품목별
@@ -2443,21 +2443,21 @@ def render_purchase_tab(ctx):
                       "마진율": round((pp - c) / pp * 100) if (c is not None and pp) else None,
                       f"{sel[1]}월 판매수량": sold or None,
                       f"{sel[1]}월 매입수량": sum(r["qty"] for r in rs if mkey(r["date"]) == sel) or None,
-                      "재고수량": it.main + it.vf, "재고 금액": (it.main + it.vf) * c if c is not None else None,
+                      "평택 재고": it.main, "평택 재고 금액": it.main * c if c is not None else None,
                       "최근 입고": max(r["date"] for r in rs) if rs else None})
     if irows:
         idf = pd.DataFrame(irows)
         ccfg = {c_: num_col(c_) for c_ in ("평균 매입단가", "쿠팡 단가", "개당 마진", f"{sel[1]}월 판매수량",
-                                            f"{sel[1]}월 매입수량", "재고수량", "재고 금액")}
+                                            f"{sel[1]}월 매입수량", "평택 재고", "평택 재고 금액")}
         ccfg["평균 매입단가"] = _Fmt("num", "평균 매입단가(원)")
         ccfg["쿠팡 단가"] = _Fmt("num", "쿠팡 단가(원)")
         ccfg["개당 마진"] = _Fmt("num", "개당 마진(원)")
         ccfg.update({"마진율": pct_col("마진율", 100), "최근 입고": date_col("최근 입고")})
 
         def hdr(g, sub):
-            v = sub["재고 금액"].dropna().sum()
+            v = pd.to_numeric(sub["평택 재고 금액"], errors="coerce").sum()
             no_cost = int(sub["평균 매입단가"].isna().sum())
-            return (f"**{g}** · {len(sub)}개" + (f" · 재고 금액 {won_s(v)}" if v else "")
+            return (f"**{g}** · {len(sub)}개" + (f" · 평택 재고 금액 {won_s(v)}" if v else "")
                     + (f" · 매입단가 없음 {no_cost}개" if no_cost else ""))
         grouped_tables(idf, "상품군", "품명", "buy_tbl", "_buy_pick", ccfg, gsort(idf["상품군"]), hdr, "buy_grouped")
 
