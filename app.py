@@ -407,7 +407,68 @@ def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
     return out
 
 
-PARSER_VERSION = 7     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+def parse_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> dict:
+    """'매입' 시트: [입고일 | 품명 | 수량 | 매입단가 | 매입금액 | (공장/비고)]. 단가와 금액 중 하나만 있어도 됨. 금액은 VAT 별도(공급가)."""
+    n = raw.shape[0]
+    hr = next((r for r in range(min(10, n)) if "품명" in {clean_txt(x) for x in raw.iloc[r].tolist()}), None)
+    if hr is None:
+        raise ValueError("매입 시트에서 '품명' 헤더를 찾지 못했습니다.")
+    hdr = [clean_txt(x) for x in raw.iloc[hr].tolist()]
+    find = lambda pred: next((i for i, h in enumerate(hdr) if h and pred(h)), None)
+    c_d = find(lambda h: h in ("입고일", "날짜", "일자", "매입일", "입고일자"))
+    c_n = find(lambda h: "품명" in h)
+    c_k = next((i for i, h in enumerate(hdr) if "품명" in h and i != c_n), None)     # '2026-07-06_품명' 같은 조합 키 칸
+    c_q = find(lambda h: "입고" in h and "일" not in h)                                  # 평택입고(BOX)
+    if c_q is None:
+        c_q = find(lambda h: "BOX" in h.upper())
+    if c_q is None:
+        c_q = find(lambda h: "수량" in h and "PLT" not in h.upper())
+    c_u = find(lambda h: "단가" in h)
+    c_a = find(lambda h: ("금액" in h or "합계" in h) and "단가" not in h)
+    c_s = find(lambda h: h in ("공장", "매입처", "거래처", "공급처", "구분"))
+    miss = [k for k, v in (("입고일", c_d), ("품명", c_n), ("수량", c_q)) if v is None]
+    if miss or (c_u is None and c_a is None):
+        raise ValueError(f"매입 시트에서 {', '.join(miss) or '매입단가/매입금액'} 칸을 찾지 못했습니다.")
+    recs, bad = [], 0
+    for r in range(hr + 1, n):
+        nm = raw.iat[r, c_n]
+        if not clean_txt(nm):
+            continue
+        dv = raw.iat[r, c_d]
+        d = to_date(dv)
+        if d is None and c_k is not None:                       # 날짜가 '07월 06일' 글자면 조합 키의 연도까지 있는 날짜 사용
+            d = to_date(str(raw.iat[r, c_k])[:10])
+        if d is None and clean_txt(dv):
+            d = parse_kr_date(str(dv), today_kst())[0]
+        q = to_num(raw.iat[r, c_q])
+        u = to_num(raw.iat[r, c_u]) if c_u is not None else None
+        a = to_num(raw.iat[r, c_a]) if c_a is not None else None
+        if d is None or not q:
+            bad += 1
+            continue
+        if a is None and u is not None:
+            a = u * q
+        if u is None and a is not None:
+            u = a / q
+        if a is None:
+            bad += 1
+            continue
+        sup = raw.iat[r, c_s] if c_s is not None else None
+        recs.append(dict(date=d, name=re.sub(r"\s+", " ", str(nm)).strip(), qty=q, unit=u, amount=a,
+                         supplier=str(sup).strip() if clean_txt(sup) else ""))
+    return dict(name=sheet_name, rows=recs, bad=bad)
+
+
+def is_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> bool:
+    """매입(평택 입고) 시트: 헤더에 '평택입고'나 '매입합계'가 있거나, 시트 이름에 '매입'이 있는데 쿠팡 PO 시트가 아닌 것."""
+    for r in range(min(8, raw.shape[0])):
+        vals = {clean_txt(x) for x in raw.iloc[r].tolist()}
+        if any("평택입고" in v or "매입합계" in v or "매입금액" in v for v in vals):
+            return True
+    return "매입" in sheet_name and "PO" not in sheet_name.upper()
+
+
+PARSER_VERSION = 9     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -415,12 +476,14 @@ def load_workbook(file_bytes: bytes, parser_version: int = PARSER_VERSION) -> di
     """월별 재고 시트와 쿠팡 PO 이력 시트를 나눠 읽는다. 형식이 맞지 않는 시트는 건너뛰고 이유를 남긴다."""
     import io
     xl = pd.ExcelFile(io.BytesIO(file_bytes))
-    sheets, po, skipped, targets, manual = [], [], [], {}, []
+    sheets, po, skipped, targets, manual, purchases = [], [], [], {}, [], []
     for s in xl.sheet_names:
         raw = xl.parse(s, header=None)
         try:
             if "기타매출" in s or "매출입력" in s:
                 manual += parse_manual_sales(raw, today_kst().year)
+            elif is_purchase_sheet(raw, s):
+                purchases.append(parse_purchase_sheet(raw, s))
             elif "목표" in s:
                 targets.update(parse_target_sheet(raw, today_kst().year))
             elif is_po_sheet(raw):
@@ -429,7 +492,7 @@ def load_workbook(file_bytes: bytes, parser_version: int = PARSER_VERSION) -> di
                 sheets.append(parse_sheet(raw, s, today_kst().year))
         except Exception as e:          # 메모 탭 등 형식이 다른 시트 때문에 전체가 멈추지 않도록
             skipped.append(f"{s}: {e}")
-    return dict(sheets=sheets, po=po, skipped=skipped, targets=targets, manual=manual)
+    return dict(sheets=sheets, po=po, skipped=skipped, targets=targets, manual=manual, purchases=purchases)
 
 
 def as_date(v):
@@ -486,6 +549,7 @@ class Item:
     plan_until: object     # 예정 출고가 입력된 마지막 날짜 (없으면 None)
     sales: dict            # {날짜: 출고} 전 월 시트 합본 (PO 예측에 사용)
     policy: str = ""       # 공급 방식: "" 일반 발주 / "supply" 공장 공급 시 수령 / "mto" PO 맞춤 생산
+    po_sched: dict = None  # 밀크런: {날짜: 수량} 쿠팡PO 탭의 확정 PO + 이력 예측 PO (매일 평균 대신 이 날짜에 묶어서 출고)
 
 
 def calc_adu(sales: dict, entered: list, base: date, window: int):
@@ -574,6 +638,8 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
       VF형    : VF가 출고로 감소 → VF(+이동중) < 트리거 이면 쿠팡 PO(MOQ×배수)만큼 평택→VF 이동
     """
     main, vf = item.main, item.vf
+    adu_scale = (adu / item.adu) if item.adu > 0 else 1.0
+    sched_end = max(item.po_sched) if item.po_sched else None       # 예측 범위가 끝난 뒤는 일평균으로
     inbound = {}
     for d, q, _ in item.inbound:
         if d >= base:
@@ -605,6 +671,10 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
             demand = item.plan.get(day, 0.0)
             if log and demand > 0 and item.is_milkrun:
                 events.append((day, f"📤 [쿠팡 밀크런 출고 예정] -{demand:,.0f}개", max(main - demand, 0.0), vf))
+        elif item.is_milkrun and item.po_sched and day <= sched_end:  # 밀크런은 PO 단위로 몰아서 나가므로 PO 일정대로 출고
+            demand = item.po_sched.get(day, 0.0) * adu_scale
+            if log and demand > 0:
+                events.append((day, f"📤 [쿠팡 PO 출고 (확정/예측)] -{demand:,.0f}개", max(main - demand, 0.0), vf))
         if demand > 0:
             if item.is_milkrun:
                 if main >= demand:
@@ -735,7 +805,10 @@ def evaluate(item: Item, sim: dict, base: date, adu: float, safety: float, lt: i
     if trans_h:
         a0, b0 = trans_h[0]
         tot = sum(b - a + 1 for a, b in trans_h)
+        lost_ = sim.get("lost") or [0.0] * n
+        short = lost_[b0] - (lost_[a0 - 1] if a0 > 0 else 0.0)        # 이 구간에 못 내보내는 수량
         gap_txt = (f"입고 전 결품 {tot}일 ({md(a0)}~{md(b0)}" + (f", {md(b0 + 1)} 입고" if b0 + 1 < n else "") + ")"
+                   + (f" · {short:,.0f}개 부족" if short >= 0.5 else "")
                    + (f" 외 {len(trans_h) - 1}회" if len(trans_h) > 1 else ""))
     elif trans_s:
         a0, b0 = trans_s[0]
@@ -986,7 +1059,7 @@ class _Fmt:
         self.kind, self.label = kind, label
 
 
-_MONEY_WORDS = ("매출", "손실", "금액", "목표", "실적", "확정", "예측", "전월", "전년", "위험", "회복", "증가")
+_MONEY_WORDS = ("매출", "매입", "이익", "손실", "금액", "목표", "실적", "확정", "예측", "전월", "전년", "위험", "회복", "증가")
 
 
 def _fmt_value(kind, label, v):
@@ -1015,9 +1088,10 @@ def _prep_table(df, ccfg):
         else:
             out[col] = cfg
     for col in df.columns:
-        if col not in out and df[col].dtype == object:
-            df[col] = [_fmt_value("date", col, v) if isinstance(v, date) else ("-" if v is None or (isinstance(v, float) and math.isnan(v)) else v)
-                       for v in df[col]]
+        if col not in out and (pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col])):
+            vals = [_fmt_value("date", col, v) if isinstance(v, date)
+                    else ("-" if v is None or (not isinstance(v, str) and pd.isna(v)) else v) for v in df[col]]
+            df[col] = pd.Series(vals, index=df.index, dtype=object)
         elif col not in out and pd.api.types.is_float_dtype(df[col]) and df[col].isna().any():
             df[col] = ["-" if pd.isna(v) else (f"{v:,.0f}" if float(v).is_integer() else f"{v:,.1f}") for v in df[col]]
     return df, out
@@ -1818,7 +1892,7 @@ def inventory_table(ctx) -> pd.DataFrame:
             "평택 결품일": off(sim["stockout"]), "안전재고 이탈일": off(ev["safety_day"]),
             "입고예정(발주완료)": int(sum(q for _, q, _ in it.inbound)) or None,
             "입고계획(미발주)": int(sum(x["qty"] for x in it.inbound_detail if not x["ordered"])) or None,
-            "차기 PO(이력예측)": ctx["next_po"].get(it.name),
+            "다음 쿠팡 PO": ctx["next_po"].get(it.name),
             "차기 쿠팡PO(시뮬)": sim["first_po"],
             "출고예정(합)": int(sum(it.plan.values())) or None,
             "적용L/T(일)": it.lt, "L/T 근거": it.lt_src,
@@ -1828,13 +1902,13 @@ def inventory_table(ctx) -> pd.DataFrame:
 
 
 INV_CORE = ["상태", "품명", "상품군", "평택재고", "안전재고 대비", "재고커버(일)", "발주 데드라인", "D-", "권장 발주일", "권장 발주량",
-            "평택 결품일", "입고예정(발주완료)", "차기 PO(이력예측)", "상세"]
+            "평택 결품일", "입고예정(발주완료)", "다음 쿠팡 PO", "상세"]
 
 
 def inv_colcfg():
     ccfg = {c: num_col(c) for c in ("평택재고", "VF재고", "안전재고", "권장 발주량", "입고예정(발주완료)",
                                      "입고계획(미발주)", "출고예정(합)")}
-    ccfg.update({c: date_col(c) for c in ("발주 데드라인", "권장 발주일", "평택 결품일", "안전재고 이탈일", "차기 PO(이력예측)", "차기 쿠팡PO(시뮬)")})
+    ccfg.update({c: date_col(c) for c in ("발주 데드라인", "권장 발주일", "평택 결품일", "안전재고 이탈일", "다음 쿠팡 PO", "차기 쿠팡PO(시뮬)")})
     ccfg["안전재고 대비"] = pct_col("안전재고 대비", 200)
     ccfg["상세"] = st.column_config.TextColumn("상세", width="large")
     return ccfg
@@ -1893,7 +1967,7 @@ def render_inventory(ctx):
             "결품까지 14일 넘게 남았어도 이 날짜가 지났거나 7일 안이면 🟡 준비로 표시\n"
             "- **🟠 입고 전 결품**: 발주완료 입고분으로 곧 회복되지만 그 전에 잠깐 비는 경우. 신규 발주가 아니라 입고 앞당기기·출고 조정 대상\n"
             "- **권장 발주량**: 신규분이 도착한 뒤 산정 기간 동안 안전재고(미기재 품목은 결품 방지) 기준 최대 부족분을 납품 MOQ 배수로 올림\n"
-            "- **차기 PO(이력예측)**은 쿠팡PO 탭 이력 기반, **차기 쿠팡PO(시뮬)**은 사이드바 트리거 가정 기반")
+            "- **다음 쿠팡 PO**: 쿠팡PO 탭에 이미 잡힌 확정 PO가 있으면 그 날짜, 없으면 이력 기반 예측일. **차기 쿠팡PO(시뮬)**은 사이드바 트리거 가정 기반")
 
     # ── 개별 SKU
     st.divider()
@@ -2228,6 +2302,152 @@ def gsort_brands(bs) -> list:
     return sorted(bs, key=lambda b: (b == "기타", order.get(b, 99), b))
 
 
+# ─────────────────────────────── 매입 · 마진 ───────────────────────────────
+def render_purchase_tab(ctx):
+    base, fcs, items, pur, ucost = ctx["base"], ctx["fcs"], ctx["items"], ctx["purchases"], ctx["unit_cost"]
+    if not pur:
+        st.info("엑셀에 '매입' 시트가 없어요. 공장에서 평택으로 들어온 내역을 [입고일 | 품명 | 수량 | 매입단가 또는 매입금액]으로 "
+                "'매입' 시트에 적어 올리면, 여기서 매출과 비교해요. 템플릿은 '🛠️ 데이터 설정' 탭에 있어요.")
+        return
+    cur = (base.year, base.month)
+    months = sorted({mkey(r["date"]) for r in pur} | {mkey(e["date"]) for f in fcs for e in f["events"]} | {cur})
+    months = [m for m in months if m <= cur]
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        sel = st.selectbox("📅 월", months, index=len(months) - 1, format_func=mlabel, key="buy_month")
+    with c2:
+        st.caption("모든 금액은 **VAT 별도** 기준이에요. 매입은 시트 금액 그대로(면세), 매출은 쿠팡 PO 단가 ÷ 1.1. "
+                   "매출원가 = 판매 수량 × 그 품목의 평균 매입단가(지금까지 매입 기준 가중평균).")
+
+    def sales_rows(fs, month):
+        """month 매출(공급가)과 매출원가. 원가를 모르는 품목 매출은 따로."""
+        rev = cogs = unknown = qty = 0.0
+        for f in fs:
+            it_name = f["item"].name if f["item"] is not None else None
+            c = ucost.get(it_name)
+            for e in f["events"]:
+                if mkey(e["date"]) != month:
+                    continue
+                v = ev_rev(e, False)
+                rev += v
+                if f.get("manual"):
+                    unknown += v
+                elif c is not None:
+                    cogs += e["deliv"] * c
+                    qty += e["deliv"]
+                else:
+                    unknown += v
+        return rev, cogs, unknown, qty
+
+    stock_val = lambda its: sum((i.main + i.vf) * ucost[i.name] for i in its if i.name in ucost)
+    item_grp = ctx["item_group"]
+
+    # ── KPI
+    p_m = [r for r in pur if mkey(r["date"]) == sel]
+    buy = sum(r["amount"] for r in p_m)
+    rev, cogs, unknown, _ = sales_rows(fcs, sel)
+    known = rev - unknown
+    gp = known - cogs
+    sv = stock_val(items)
+    tag = " (예상 포함)" if sel == cur else ""
+    kpis = [
+        (f"{sel[1]}월 매입액", won_s(buy) if buy else "0", f"{len(p_m)}건 · {sum(r['qty'] for r in p_m):,.0f}개 입고", ""),
+        (f"{sel[1]}월 매출액{tag}", won_s(rev) if rev else "0",
+         f"매입 대비 {rev / buy:.1f}배" if buy else "이 달 매입 없음", ""),
+        ("매출총이익 (원가 아는 품목)", won_s(gp) if known else "-",
+         f"마진율 {gp / known:.0%} · 원가 미확인 매출 {won_s(unknown)}" if known else "매입 단가가 있는 품목의 매출이 없어요",
+         "good" if known and gp > 0 else ("bad" if known else "")),
+        ("현재 재고 금액", won_s(sv) if sv else "-", "평택+VF 재고 × 평균 매입단가 · 돈이 묶여 있는 규모", ""),
+    ]
+    st.markdown("<div class='kpi-grid'>" + "".join(
+        f"<div class='kpi'><div class='l'>{l_}</div><div class='v'>{v_}</div><div class='s {c_}'>{s_}</div></div>"
+        for l_, v_, s_, c_ in kpis) + "</div>", unsafe_allow_html=True)
+
+    # ── 월별 추이
+    st.write("")
+    sec("📈 월별 매입 vs 매출", "막대 = 매입액·매출액, 선 = 매출총이익 (원가 아는 품목 기준)")
+    cm = [m for m in months][-12:]
+    labels = [mtick(*m) for m in cm]
+    b_s = [sum(r["amount"] for r in pur if mkey(r["date"]) == m) for m in cm]
+    sr = [sales_rows(fcs, m) for m in cm]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=labels, y=b_s, name="매입액", marker_color="#8e6bbf", hovertemplate="매입 %{y:,.0f}원<extra></extra>"))
+    fig.add_trace(go.Bar(x=labels, y=[x[0] for x in sr], name="매출액", marker_color=C["act"], hovertemplate="매출 %{y:,.0f}원<extra></extra>"))
+    fig.add_trace(go.Scatter(x=labels, y=[x[0] - x[2] - x[1] for x in sr], name="매출총이익", mode="lines+markers",
+                             line=dict(color=C["conf"], width=3), hovertemplate="이익 %{y:,.0f}원<extra></extra>"))
+    fig.update_layout(barmode="group", hovermode="x unified")
+    wide(st.plotly_chart, style_fig(fig, height=340))
+
+    # ── 상품군별
+    sec(f"📦 상품군별 {sel[1]}월 매입 · 매출 · 마진")
+    rows = []
+    for g in gsort({r["group"] for r in pur} | {f["group"] for f in fcs}):
+        fs = [f for f in fcs if f["group"] == g]
+        pg = [r for r in p_m if r["group"] == g]
+        rv, cg, un, _ = sales_rows(fs, sel)
+        kn = rv - un
+        its = [i for i in items if item_grp.get(i.name) == g]
+        if not (rv or pg or stock_val(its)):
+            continue
+        rows.append({"상품군": g, "매입수량": sum(r["qty"] for r in pg), "매입액": sum(r["amount"] for r in pg),
+                     "매출액": rv, "매출원가": cg if kn else None, "매출총이익": (kn - cg) if kn else None,
+                     "마진율": round((kn - cg) / kn * 100) if kn else None, "원가 미확인 매출": un or None,
+                     "재고 금액": stock_val(its) or None})
+    if rows:
+        wide(st.dataframe, pd.DataFrame(rows), hide_index=True,
+             column_config={**{c_: num_col(c_) for c_ in ("매입수량", "매입액", "매출액", "매출원가", "매출총이익",
+                                                          "원가 미확인 매출", "재고 금액")},
+                            "마진율": pct_col("마진율", 100)})
+
+    # ── 품목별
+    st.write("")
+    sec("🔍 품목별 단가 · 마진", "쿠팡 공급단가 = 최근 PO 단가 ÷ 1.1 · 개당 마진 = 공급단가 − 평균 매입단가")
+    po_price = {}
+    for f in fcs:
+        if f["item"] is not None and f["price"]:
+            po_price[f["item"].name] = f["price"] / 1.1
+    irows = []
+    for it in items:
+        rs = [r for r in pur if r["item"] == it.name]
+        if not rs and it.name not in po_price:
+            continue
+        c, pp = ucost.get(it.name), po_price.get(it.name)
+        fs = [f for f in fcs if f["item"] is not None and f["item"].name == it.name]
+        rv, cg, un, q = sales_rows(fs, sel)
+        sold = sum(e["deliv"] for f in fs for e in f["events"] if mkey(e["date"]) == sel)
+        irows.append({"상품군": item_grp.get(it.name, "기타"), "품명": it.name,
+                      "평균 매입단가": c, "쿠팡 공급단가": pp,
+                      "개당 마진": (pp - c) if (c is not None and pp) else None,
+                      "마진율": round((pp - c) / pp * 100) if (c is not None and pp) else None,
+                      f"{sel[1]}월 판매수량": sold or None,
+                      f"{sel[1]}월 매입수량": sum(r["qty"] for r in rs if mkey(r["date"]) == sel) or None,
+                      "재고수량": it.main + it.vf, "재고 금액": (it.main + it.vf) * c if c is not None else None,
+                      "최근 입고": max(r["date"] for r in rs) if rs else None})
+    if irows:
+        idf = pd.DataFrame(irows)
+        ccfg = {c_: num_col(c_) for c_ in ("평균 매입단가", "쿠팡 공급단가", "개당 마진", f"{sel[1]}월 판매수량",
+                                            f"{sel[1]}월 매입수량", "재고수량", "재고 금액")}
+        ccfg["평균 매입단가"] = _Fmt("num", "평균 매입단가(원)")
+        ccfg["쿠팡 공급단가"] = _Fmt("num", "쿠팡 공급단가(원)")
+        ccfg["개당 마진"] = _Fmt("num", "개당 마진(원)")
+        ccfg.update({"마진율": pct_col("마진율", 100), "최근 입고": date_col("최근 입고")})
+
+        def hdr(g, sub):
+            v = sub["재고 금액"].dropna().sum()
+            no_cost = int(sub["평균 매입단가"].isna().sum())
+            return (f"**{g}** · {len(sub)}개" + (f" · 재고 금액 {won_s(v)}" if v else "")
+                    + (f" · 매입단가 없음 {no_cost}개" if no_cost else ""))
+        grouped_tables(idf, "상품군", "품명", "buy_tbl", "_buy_pick", ccfg, gsort(idf["상품군"]), hdr, "buy_grouped")
+
+
+    with st.expander(f"📜 매입 내역 ({len(pur)}건)"):
+        wide(st.dataframe, pd.DataFrame([{"입고일": r["date"], "품명(매입)": r["name"], "연결 품목": disp(r["item"]) if r["item"] else "❌ 연결 안 됨",
+                                         "상품군": r["group"], "수량": r["qty"], "매입단가": r["unit"], "매입금액": r["amount"],
+                                         } for r in sorted(pur, key=lambda x: x["date"], reverse=True)]),
+             hide_index=True, column_config={"입고일": date_col("입고일"), "수량": num_col("수량"),
+                                             "매입단가": _Fmt("num", "매입단가(원)"), "매입금액": num_col("매입금액")})
+
+
 # ─────────────────────────────── 공장 발주 시뮬레이터 ───────────────────────────────
 def scenario_metrics(fs, base, vat, month, first_arrival=None, until=None):
     """until: 이 날짜 전까지만 집계 (다음 발주분이 들어올 수 있는 날까지 = 이번 발주의 책임 구간)"""
@@ -2518,6 +2738,23 @@ def build_report(ctx) -> bytes:
     return buf.getvalue()
 
 
+def purchase_template(item_names) -> bytes:
+    import io
+    names = list(item_names)[:3] or ["품명"]
+    df = pd.DataFrame([{"날짜": today_kst(), "품명": n, "평택입고(BOX)": 1000, "수량(PLT)": None, "단가": 1000,
+                        "매입합계": 1000000, "구분": ""} for n in names])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        df.to_excel(xw, sheet_name="매입", index=False)
+        ws = xw.sheets["매입"]
+        for col, w in zip("ABCDEFG", (12, 46, 14, 10, 10, 14, 12)):
+            ws.column_dimensions[col].width = w
+        ws.cell(row=len(names) + 3, column=1,
+                value="입고될 때마다 한 줄씩. 금액은 면세(VAT 없음) 기준. 단가와 매입합계 중 하나만 적어도 됩니다. "
+                      "같은 품목 단가가 달라도 수량 기준 평균으로 계산합니다. 품명은 재고시트 품명과 같게 적으면 자동 연결됩니다.")
+    return buf.getvalue()
+
+
 def manual_template() -> bytes:
     import io
     df = pd.DataFrame([{"날짜": today_kst(), "상품군": EXTRA_TARGET_GROUPS[0], "매출금액": 1000000, "메모": "예시 행 (지우고 쓰세요)"}])
@@ -2549,6 +2786,16 @@ def build_notes(ctx):
     base, items, sheets, wb = ctx["base"], ctx["items"], ctx["sheets"], ctx["wb"]
     po_recs, po_names, mapping = ctx["po_recs"], ctx["po_names"], ctx["mapping"]
     notes = []
+    for p in wb.get("purchases", []):
+        notes.append(f"[{p['name']}] 매입 {len(p['rows'])}행 인식" + (f", 날짜·수량·금액을 못 읽은 행 {p['bad']}개 제외" if p["bad"] else ""))
+    pm = ctx.get("pmatch") or {}
+    if pm:
+        un = [k_ for k_, v_ in pm.items() if not v_[0]]
+        fz = [f"{k_} → {v_[0]}" for k_, v_ in pm.items() if v_[0] and v_[1] != "일치"]
+        if un:
+            notes.append(f"재고시트와 연결 안 된 매입 품명 {len(un)}개 (원가 계산에서 빠짐): {', '.join(un)}")
+        if fz:
+            notes.append(f"매입 품명을 유사 이름으로 연결: {'; '.join(fz)}")
     pol = [f"{g}: {p['note']}" for g, p in GROUP_POLICY.items()]
     notes.append("상품군별 공급 방식 적용 → " + " / ".join(pol))
     empty = [s["name"] for s in sheets if not s.get("has_data", True)]
@@ -2687,8 +2934,8 @@ def main():
                 + (f" · 마지막 PO {max(r['date'] for r in po_recs):%m/%d}" if po_recs else "") + "</div>",
                 unsafe_allow_html=True)
 
-    t_home, t_rev, t_inv, t_sim, t_data = st.tabs(
-        ["🏠 홈", "💰 매출 · 쿠팡 PO", "📦 재고 · 공장 발주", "🏭 발주 시뮬레이터", "🛠️ 데이터 설정"])
+    t_home, t_rev, t_buy, t_inv, t_sim, t_data = st.tabs(
+        ["🏠 홈", "💰 매출 · 쿠팡 PO", "💵 매입 · 마진", "📦 재고 · 공장 발주", "🏭 발주 시뮬레이터", "🛠️ 데이터 설정"])
 
     # ── 데이터 설정 ①: 입고 일정 보정 (품목 계산 전에 반영)
     latest_sheet = data_sheets(sheets)[-1]
@@ -2784,6 +3031,12 @@ def main():
             "실적으로 합산됩니다. 금액은 VAT 포함, 날짜 대신 '2026-10'처럼 월만 적어도 됩니다. 상품군을 비우면 '네이버 두부모래'로 봅니다.")
         st.download_button("⬇️ 기타매출 시트 템플릿 (.xlsx)", manual_template(), file_name="기타매출_템플릿.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.divider()
+        sec("💵 매입 입력 ('매입' 시트)",
+            "공장에서 평택으로 실제 입고된 내역을 마스터 엑셀 '매입' 시트에 [입고일 | 품명 | 수량 | 매입단가 또는 매입금액]으로 적으면 "
+            "'매입 · 마진' 탭에서 매출과 비교합니다. 금액은 VAT 별도(공급가) 기준입니다.")
+        st.download_button("⬇️ 매입 시트 템플릿 (.xlsx)", purchase_template(sorted(i.name for i in items)),
+                           file_name="매입_템플릿.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     targets = {}
     for (y, m) in tmonths:
         for _, r_ in tedit.iterrows():
@@ -2794,18 +3047,40 @@ def main():
         if ym not in tmonths:
             targets[ym] = {g: v * 1e4 for g, v in d.items()}
 
-    next_po = {}
+    next_po = {}            # 다음 쿠팡 PO: 엑셀에 이미 잡힌 확정 PO가 있으면 그게 먼저, 없으면 예측
     for f in fcs:
-        if f["item"] is not None and f["next"]:
+        if f["item"] is None:
+            continue
+        conf = [e["date"] for e in f["events"] if e["kind"] == "확정" and e["date"] > base]
+        cands = [d for d in ([min(conf)] if conf else []) + ([f["next"]] if f["next"] else [])]
+        if cands:
             n0 = next_po.get(f["item"].name)
-            next_po[f["item"].name] = min(n0, f["next"]) if n0 else f["next"]
+            nd = min(cands)
+            next_po[f["item"].name] = min(n0, nd) if n0 else nd
 
+    sched = {}
+    for f in fcs:
+        if f["item"] is not None and f["item"].is_milkrun:
+            d_ = sched.setdefault(f["item"].name, {})
+            for e in f["events"]:
+                if e["kind"] in ("확정", "예측") and e["date"] > base:
+                    d_[e["date"]] = d_.get(e["date"], 0.0) + e["demand"]
+    items = [dataclasses.replace(i, po_sched=sched[i.name]) if i.name in sched else i for i in items]
     calc = {}
     for it in items:
         sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
         calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days, over_days))
 
     set_short_names({i.name for i in items} | {f["name"] for f in fcs})
+    pur = [dict(r) for p in wb.get("purchases", []) for r in p["rows"]]
+    pmatch = auto_match(sorted({r["name"] for r in pur}), [i.name for i in items]) if pur else {}
+    for r in pur:
+        r["item"] = pmatch[r["name"]][0]
+        r["group"] = group_of(r["item"] or r["name"], rules)
+    unit_cost = {}
+    for nm_ in {r["item"] for r in pur if r["item"]}:
+        rs = [r for r in pur if r["item"] == nm_]
+        unit_cost[nm_] = sum(r["amount"] for r in rs) / sum(r["qty"] for r in rs)     # 가중평균 매입단가
     po_by_name = {}
     for r in po_recs:
         po_by_name.setdefault(r["name"], []).append(r)
@@ -2815,7 +3090,7 @@ def main():
                po_by_name=po_by_name, deadlines={n: c_[1] for n, c_ in calc.items()},
                months=months_span(fcs, base, horizon_end) if fcs else [], stale_days=stale,
                sheets=sheets, wb=wb, po_recs=po_recs, po_names=po_names, mapping=mapping, overrides=overrides,
-               excluded=excluded, latest=latest)
+               excluded=excluded, latest=latest, purchases=pur, pmatch=pmatch, unit_cost=unit_cost)
     ctx["inv_df"] = inventory_table(ctx)
 
     unmatched = [p for p in po_names if p not in mapping]
@@ -2845,6 +3120,8 @@ def main():
         render_po_tab(ctx)
     with t_inv:
         render_inventory(ctx)
+    with t_buy:
+        render_purchase_tab(ctx)
     with t_sim:
         render_simulator(ctx)
     with t_data:
