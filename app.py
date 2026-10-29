@@ -1043,8 +1043,17 @@ def forecast_all(po_recs, items, mapping, base, end, cfg):
     return [forecast_po(nm, recs, base, end, item_by.get(mapping.get(nm)), cfg) for nm, recs in by_name.items()]
 
 
+# 부가세가 없는 면세(비과세) 상품군: 쿠팡 단가에 VAT가 없으므로 ÷1.1 하지 않는다
+TAX_EXEMPT_GROUPS = {"장작"}
+
+
+def vk(e, vat_incl: bool) -> float:
+    """매출 금액에 곱할 계수: VAT 포함으로 보거나 면세 품목이면 1, 아니면 공급가로 ÷1.1"""
+    return 1.0 if (vat_incl or e.get("exempt")) else 1 / 1.1
+
+
 def ev_rev(e, vat_incl: bool, demand: bool = False) -> float:
-    return (e["demand"] if demand else e["deliv"]) * e["price"] * (1.0 if vat_incl else 1 / 1.1)
+    return (e["demand"] if demand else e["deliv"]) * e["price"] * vk(e, vat_incl)
 
 
 # ─────────────────────────────── UI ───────────────────────────────
@@ -1700,7 +1709,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
         rk = [e for e in f["events"] if e["kind"] == "확정" and in_scope(e["date"]) and e.get("risk", 0) > 1e-9]
         if not sh and not rk:
             continue
-        lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] for e in es) * k
+        lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] * vk(e, vat_incl) for e in es)
         first = min(e["date"] for e in sh + rk)
         lt = it.lt if it else None
         cut = base + timedelta(days=lt) if lt else None          # 오늘 공장 발주해도 이 날 전에는 입고 불가
@@ -1714,7 +1723,7 @@ def render_loss(view, base, sel, horizon_end, vat_incl, cfg, deadlines):
             "미납 PO 건수": len(sh), "첫 미납일": first.strftime("%m/%d" if first.year == base.year else "%y/%m/%d"),
             "평택 재고": int(it.main) if it else None, "발주완료 입고": inb,
             "└ 리드타임 내(못 막음)": int(lost(unrec)), "└ 신규 발주로 회복 가능": int(lost(rec)),
-            "확정 PO 납품 위험": int(sum(e["risk"] * e["price"] for e in rk) * k),
+            "확정 PO 납품 위험": int(sum(e["risk"] * e["price"] * vk(e, vat_incl) for e in rk)),
             "리드타임": lt,
             "공장발주 데드라인": (ev["deadline"].strftime("%m/%d") if ev and ev["deadline"] else "-"),
         })
@@ -1864,7 +1873,7 @@ def render_po_detail(f, base, sel, months, vat_incl, cfg):
         hist = [x for x in f["recs"]][-60:][::-1]
         wide(st.dataframe, pd.DataFrame([{
             "일자": x["date"].strftime("%Y-%m-%d") + f"({wd[x['date'].weekday()]})", "수량": int(x["qty"]),
-            "단가": int(x["price"]), "매출": int(x["qty"] * x["price"] * (1 if vat_incl else 1 / 1.1)),
+            "단가": int(x["price"]), "매출": int(x["qty"] * x["price"] * (1.0 if vat_incl or f.get("exempt") else 1 / 1.1)),
             "센터": x["center"], "상태": "확정(미래)" if x["date"] > base else ("0개 납품" if x["qty"] <= 0 else "")}
             for x in hist]), hide_index=True,
              column_config={k: num_col(k) for k in ("수량", "단가", "매출")})
@@ -2114,7 +2123,7 @@ def render_home(ctx):
     r_dem = month_tot(fcs, cur, vat, demand=True)
     tgt = total_target(ctx["targets"], cur)
     r_ly = month_tot(fcs, (cur[0] - 1, cur[1]), vat, "실적")
-    risk = sum(e.get("risk", 0) * e["price"] * k for f in fcs for e in f["events"] if e["kind"] == "확정")
+    risk = sum(e.get("risk", 0) * e["price"] * vk(e, vat) for f in fcs for e in f["events"] if e["kind"] == "확정")
     n_now = int((inv["_tier"] <= 1).sum())
     n_soon = int(inv["_tier"].isin([2, 3]).sum())
 
@@ -2167,7 +2176,7 @@ def render_home(ctx):
     for f in fcs:
         es = [e for e in f["events"] if e["kind"] == "확정" and e.get("risk", 0) > 1e-9]
         if es:
-            amt = sum(e["risk"] * e["price"] * k for e in es)
+            amt = sum(e["risk"] * e["price"] * vk(e, vat) for e in es)
             c_rows.append(("#e76f51", disp(f["name"]), "확정 PO 재고 없음",
                            f"{es[0]['date']:%m/%d}부터 {sum(e['risk'] for e in es):,.0f}개 모자람 ({won_s(amt)})"))
     for _, r in inv[inv["_tier"] == 4.5].iterrows():
@@ -2316,7 +2325,8 @@ def render_purchase_tab(ctx):
     with c1:
         sel = st.selectbox("📅 월", months, index=len(months) - 1, format_func=mlabel, key="buy_month")
     with c2:
-        st.caption("모든 금액은 **VAT 별도** 기준이에요. 매입은 시트 금액 그대로(면세), 매출은 쿠팡 PO 단가 ÷ 1.1. "
+        st.caption("모든 금액은 **VAT 별도** 기준이에요. 매입은 시트 금액 그대로(면세), 매출은 쿠팡 PO 단가 ÷ 1.1 "
+                   f"(비과세 상품군 {', '.join(sorted(TAX_EXEMPT_GROUPS))}은 나누지 않음). "
                    "매출원가 = 판매 수량 × 그 품목의 평균 매입단가(지금까지 매입 기준 가중평균).")
 
     def sales_rows(fs, month):
@@ -2401,11 +2411,11 @@ def render_purchase_tab(ctx):
 
     # ── 품목별
     st.write("")
-    sec("🔍 품목별 단가 · 마진", "쿠팡 공급단가 = 최근 PO 단가 ÷ 1.1 · 개당 마진 = 공급단가 − 평균 매입단가")
+    sec("🔍 품목별 단가 · 마진", "쿠팡 공급단가 = 최근 PO 단가 ÷ 1.1 (비과세 품목은 그대로) · 개당 마진 = 공급단가 − 평균 매입단가")
     po_price = {}
     for f in fcs:
         if f["item"] is not None and f["price"]:
-            po_price[f["item"].name] = f["price"] / 1.1
+            po_price[f["item"].name] = f["price"] if f.get("exempt") else f["price"] / 1.1
     irows = []
     for it in items:
         rs = [r for r in pur if r["item"] == it.name]
@@ -2453,13 +2463,13 @@ def scenario_metrics(fs, base, vat, month, first_arrival=None, until=None):
     """until: 이 날짜 전까지만 집계 (다음 발주분이 들어올 수 있는 날까지 = 이번 발주의 책임 구간)"""
     k = 1.0 if vat else 1 / 1.1
     fut = [e for f in fs for e in f["events"] if e["date"] > base and (until is None or e["date"] < until)]
-    lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] * k for e in es)
+    lost = lambda es: sum((e["demand"] - e["deliv"]) * e["price"] * vk(e, vat) for e in es)
     return dict(
         loss_pre=lost([e for e in fut if first_arrival and e["date"] < first_arrival]),
         rev=sum(ev_rev(e, vat) for e in fut),
         rev_m=sum(ev_rev(e, vat) for e in fut if mkey(e["date"]) == month),
-        loss=sum((e["demand"] - e["deliv"]) * e["price"] * k for e in fut),
-        risk=sum(e.get("risk", 0) * e["price"] * k for e in fut if e["kind"] == "확정"))
+        loss=sum((e["demand"] - e["deliv"]) * e["price"] * vk(e, vat) for e in fut),
+        risk=sum(e.get("risk", 0) * e["price"] * vk(e, vat) for e in fut if e["kind"] == "확정"))
 
 
 def _sim_card(nm, lst, it, sim0, sim1, ev0, ev1, m0, m1, has_po, base, cur, warn, w_end) -> str:
@@ -2702,8 +2712,8 @@ def build_report(ctx) -> bytes:
         loss = []
         for f in fcs:
             fut = [e for e in f["events"] if e["date"] > base]
-            ls = sum((e["demand"] - e["deliv"]) * e["price"] * k for e in fut)
-            rk = sum(e.get("risk", 0) * e["price"] * k for e in fut)
+            ls = sum((e["demand"] - e["deliv"]) * e["price"] * vk(e, vat) for e in fut)
+            rk = sum(e.get("risk", 0) * e["price"] * vk(e, vat) for e in fut)
             if ls > 0 or rk > 0:
                 loss.append({"상품군": f["group"], "품명": f["name"], "재고부족 손실": int(ls), "확정 PO 납품 위험": int(rk),
                              "첫 미납일": min((e["date"] for e in fut if e["demand"] - e["deliv"] > 1e-9 or e.get("risk", 0) > 1e-9), default=None)})
@@ -3007,6 +3017,10 @@ def main():
     fcs = forecast_all(po_recs, items, mapping, base, horizon_end, po_cfg) if po_recs else []
     for f in fcs:
         f["group"] = group_of(f["name"], rules)
+        if f["group"] in TAX_EXEMPT_GROUPS:
+            f["exempt"] = True
+            for e in f["events"]:
+                e["exempt"] = True
     fcs += manual_entries(wb.get("manual", []), base)
     item_group = {i.name: group_of(i.name, rules) for i in items}
     groups = gsort(set(item_group.values()) | {f["group"] for f in fcs})
