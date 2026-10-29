@@ -2320,6 +2320,7 @@ def gsort_brands(bs) -> list:
 # ─────────────────────────────── 매입 · 마진 ───────────────────────────────
 def render_purchase_tab(ctx):
     base, fcs, items, pur, ucost = ctx["base"], ctx["fcs"], ctx["items"], ctx["purchases"], ctx["unit_cost"]
+    vat = ctx["vat_incl"]
     if not pur:
         st.info("엑셀에 '매입' 시트가 없어요. 공장에서 평택으로 들어온 내역을 [입고일 | 품명 | 수량 | 매입단가 또는 매입금액]으로 "
                 "'매입' 시트에 적어 올리면, 여기서 매출과 비교해요. 템플릿은 '🛠️ 데이터 설정' 탭에 있어요.")
@@ -2331,9 +2332,10 @@ def render_purchase_tab(ctx):
     with c1:
         sel = st.selectbox("📅 월", months, index=len(months) - 1, format_func=mlabel, key="buy_month")
     with c2:
-        st.caption("모든 금액은 **VAT 별도** 기준이에요. 매입은 시트 금액 그대로(면세), 매출은 쿠팡 PO 단가 ÷ 1.1 "
-                   f"(비과세 상품군 {', '.join(sorted(TAX_EXEMPT_GROUPS))}은 나누지 않음). "
-                   "매출원가 = 판매 수량 × 그 품목의 평균 매입단가(지금까지 매입 기준 가중평균).")
+        ex_ = ", ".join(sorted(TAX_EXEMPT_GROUPS))
+        st.caption(("사이드바 **VAT 포함** 기준 · 엑셀에 적힌 금액 그대로예요. " if vat else
+                    f"사이드바 **VAT 제외** 기준 · 매출·매입 모두 ÷1.1 (비과세 {ex_}은 그대로). ")
+                   + "매출원가 = 판매 수량 × 그 품목의 평균 매입단가(지금까지 매입 기준 가중평균).")
 
     def sales_rows(fs, month):
         """month 매출(공급가)과 매출원가. 원가를 모르는 품목 매출은 따로."""
@@ -2344,11 +2346,11 @@ def render_purchase_tab(ctx):
             for e in f["events"]:
                 if mkey(e["date"]) != month:
                     continue
-                v = ev_rev(e, False)
+                v = ev_rev(e, vat)
                 rev += v
                 if f.get("manual"):
                     if e.get("cost") is not None:           # 기타매출 시트에 같은 줄 매입금액이 있으면 그걸 원가로 (VAT 포함 → 공급가)
-                        cogs += e["cost"] * vk(e, False)
+                        cogs += e["cost"] * vk(e, vat)
                     else:
                         unknown += v
                 elif c is not None:
@@ -2420,11 +2422,12 @@ def render_purchase_tab(ctx):
 
     # ── 품목별
     st.write("")
-    sec("🔍 품목별 단가 · 마진", "쿠팡 공급단가 = 최근 PO 단가 ÷ 1.1 (비과세 품목은 그대로) · 개당 마진 = 공급단가 − 평균 매입단가")
+    sec("🔍 품목별 단가 · 마진", ("쿠팡 단가 = 최근 PO 단가 (VAT 포함)" if vat else "쿠팡 단가 = 최근 PO 단가 ÷ 1.1 (비과세 품목은 그대로)")
+        + " · 개당 마진 = 쿠팡 단가 − 평균 매입단가")
     po_price = {}
     for f in fcs:
         if f["item"] is not None and f["price"]:
-            po_price[f["item"].name] = f["price"] if f.get("exempt") else f["price"] / 1.1
+            po_price[f["item"].name] = f["price"] * vk(f, vat)
     irows = []
     for it in items:
         rs = [r for r in pur if r["item"] == it.name]
@@ -2435,7 +2438,7 @@ def render_purchase_tab(ctx):
         rv, cg, un, q = sales_rows(fs, sel)
         sold = sum(e["deliv"] for f in fs for e in f["events"] if mkey(e["date"]) == sel)
         irows.append({"상품군": item_grp.get(it.name, "기타"), "품명": it.name,
-                      "평균 매입단가": c, "쿠팡 공급단가": pp,
+                      "평균 매입단가": c, "쿠팡 단가": pp,
                       "개당 마진": (pp - c) if (c is not None and pp) else None,
                       "마진율": round((pp - c) / pp * 100) if (c is not None and pp) else None,
                       f"{sel[1]}월 판매수량": sold or None,
@@ -2444,10 +2447,10 @@ def render_purchase_tab(ctx):
                       "최근 입고": max(r["date"] for r in rs) if rs else None})
     if irows:
         idf = pd.DataFrame(irows)
-        ccfg = {c_: num_col(c_) for c_ in ("평균 매입단가", "쿠팡 공급단가", "개당 마진", f"{sel[1]}월 판매수량",
+        ccfg = {c_: num_col(c_) for c_ in ("평균 매입단가", "쿠팡 단가", "개당 마진", f"{sel[1]}월 판매수량",
                                             f"{sel[1]}월 매입수량", "재고수량", "재고 금액")}
         ccfg["평균 매입단가"] = _Fmt("num", "평균 매입단가(원)")
-        ccfg["쿠팡 공급단가"] = _Fmt("num", "쿠팡 공급단가(원)")
+        ccfg["쿠팡 단가"] = _Fmt("num", "쿠팡 단가(원)")
         ccfg["개당 마진"] = _Fmt("num", "개당 마진(원)")
         ccfg.update({"마진율": pct_col("마진율", 100), "최근 입고": date_col("최근 입고")})
 
@@ -3102,6 +3105,9 @@ def main():
     for r in pur:
         r["item"] = pmatch[r["name"]][0]
         r["group"] = group_of(r["item"] or r["name"], rules)
+        if not vat_incl and r["group"] not in TAX_EXEMPT_GROUPS:     # VAT 포함 끄면 장작 빼고 ÷1.1 (모든 시트 공통)
+            r["amount"] /= 1.1
+            r["unit"] = r["unit"] / 1.1 if r["unit"] else r["unit"]
     unit_cost = {}
     for nm_ in {r["item"] for r in pur if r["item"]}:
         rs = [r for r in pur if r["item"] == nm_]
@@ -3109,7 +3115,7 @@ def main():
     for x in wb.get("manual", []):                      # '기타매출' 시트의 매입금액 (수량 없이 금액만)
         if x.get("buy"):
             pur.append(dict(date=x["date"], name=x["group"], qty=0.0, unit=None, supplier="",
-                            amount=x["buy"] * (1.0 if x["group"] in TAX_EXEMPT_GROUPS else 1 / 1.1),
+                            amount=x["buy"] * (1.0 if vat_incl or x["group"] in TAX_EXEMPT_GROUPS else 1 / 1.1),
                             item=None, group=x["group"], manual=True))
     po_by_name = {}
     for r in po_recs:
