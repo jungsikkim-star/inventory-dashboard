@@ -381,7 +381,7 @@ def parse_target_sheet(raw: pd.DataFrame, ref_year: int) -> dict:
 
 
 def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
-    """'기타매출' 시트: [날짜 | 상품군 | 매출금액 | (메모)]. 날짜 대신 '2026-10' 같은 월만 적으면 그 달 1일로 봅니다."""
+    """'기타매출' 시트: [날짜 | 상품군 | (매입금액) | 매출금액 | (메모)]. 날짜 대신 '2026-10' 같은 월만 적으면 그 달 1일로 봅니다."""
     n = raw.shape[0]
     hr = next((r for r in range(min(10, n))
                if any("매출" in clean_txt(x) or "금액" in clean_txt(x) for x in raw.iloc[r].tolist())
@@ -390,7 +390,10 @@ def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
         raise ValueError("기타매출 시트에서 '날짜'와 '매출금액' 헤더를 찾지 못했습니다.")
     hdr = [clean_txt(x) for x in raw.iloc[hr].tolist()]
     c_d = next(i for i, h in enumerate(hdr) if h in ("날짜", "일자", "월", "기간"))
-    c_a = next(i for i, h in enumerate(hdr) if "매출" in h or "금액" in h)
+    c_a = next((i for i, h in enumerate(hdr) if "매출" in h), None)                      # 매출금액
+    if c_a is None:
+        c_a = next(i for i, h in enumerate(hdr) if "금액" in h and "매입" not in h)
+    c_b = next((i for i, h in enumerate(hdr) if "매입" in h), None)                      # 매입금액 (선택)
     c_g = next((i for i, h in enumerate(hdr) if h in ("상품군", "품명", "채널", "구분")), None)
     out = []
     for r in range(hr + 1, n):
@@ -400,10 +403,11 @@ def parse_manual_sales(raw: pd.DataFrame, ref_year: int) -> list:
             ym = parse_month_label(v, ref_year)
             d = date(ym[0], ym[1], 1) if ym else None
         amt = to_num(raw.iat[r, c_a])
-        if d is None or not amt:
+        buy = to_num(raw.iat[r, c_b]) if c_b is not None else None
+        if d is None or not (amt or buy):
             continue
         g = raw.iat[r, c_g] if c_g is not None else None
-        out.append(dict(date=d, amount=amt, group=str(g).strip() if clean_txt(g) else EXTRA_TARGET_GROUPS[0]))
+        out.append(dict(date=d, amount=amt or 0.0, buy=buy, group=str(g).strip() if clean_txt(g) else EXTRA_TARGET_GROUPS[0]))
     return out
 
 
@@ -468,7 +472,7 @@ def is_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> bool:
     return "매입" in sheet_name and "PO" not in sheet_name.upper()
 
 
-PARSER_VERSION = 9     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+PARSER_VERSION = 10     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -1026,12 +1030,14 @@ def manual_entries(rows, base) -> list:
         rs = sorted(rs, key=lambda x: x["date"])
         past = [x["date"] for x in rs if x["date"] <= base]
         out.append(dict(
-            name=f"{g} (직접입력)", item=None, price=0.0, Q=None, rate=0.0, r_po=0.0, r_sheet=None, rate_src="",
+            name=f"{g} (직접입력)", item=None, exempt=g in TAX_EXEMPT_GROUPS, price=0.0, Q=None, rate=0.0, r_po=0.0, r_sheet=None, rate_src="",
             gap=None, next=None, overdue=False, last=(past[-1] if past else None), fut_last=None, zero60=0,
             note="'기타매출' 시트 직접 입력 (예측 없음)", q_hist=[], consumed=None, start_stock=None, group=g, manual=True,
             recs=[dict(date=x["date"], name=g, qty=x["amount"], price=1.0, center="직접입력") for x in rs],
             events=[dict(date=x["date"], kind="실적" if x["date"] <= base else "확정",
-                         demand=x["amount"], deliv=x["amount"], price=1.0) for x in rs]))
+                         demand=x["amount"], deliv=x["amount"], price=1.0, cost=x.get("buy"),
+                         exempt=g in TAX_EXEMPT_GROUPS)          # 매출·매입 금액 모두 VAT 포함으로 보고, 과세 품목은 ÷1.1
+                    for x in rs if x["amount"]]))
     return out
 
 
@@ -2341,7 +2347,10 @@ def render_purchase_tab(ctx):
                 v = ev_rev(e, False)
                 rev += v
                 if f.get("manual"):
-                    unknown += v
+                    if e.get("cost") is not None:           # 기타매출 시트에 같은 줄 매입금액이 있으면 그걸 원가로 (VAT 포함 → 공급가)
+                        cogs += e["cost"] * vk(e, False)
+                    else:
+                        unknown += v
                 elif c is not None:
                     cogs += e["deliv"] * c
                     qty += e["deliv"]
@@ -2361,7 +2370,7 @@ def render_purchase_tab(ctx):
     sv = stock_val(items)
     tag = " (예상 포함)" if sel == cur else ""
     kpis = [
-        (f"{sel[1]}월 매입액", won_s(buy) if buy else "0", f"{len(p_m)}건 · {sum(r['qty'] for r in p_m):,.0f}개 입고", ""),
+        (f"{sel[1]}월 매입액", won_s(buy) if buy else "0", f"{len(p_m)}건" + (f" · {sum(r['qty'] for r in p_m):,.0f}개 입고" if any(r['qty'] for r in p_m) else ""), ""),
         (f"{sel[1]}월 매출액{tag}", won_s(rev) if rev else "0",
          f"매입 대비 {rev / buy:.1f}배" if buy else "이 달 매입 없음", ""),
         ("매출총이익 (원가 아는 품목)", won_s(gp) if known else "-",
@@ -2399,7 +2408,7 @@ def render_purchase_tab(ctx):
         its = [i for i in items if item_grp.get(i.name) == g]
         if not (rv or pg or stock_val(its)):
             continue
-        rows.append({"상품군": g, "매입수량": sum(r["qty"] for r in pg), "매입액": sum(r["amount"] for r in pg),
+        rows.append({"상품군": g, "매입수량": sum(r["qty"] for r in pg) or None, "매입액": sum(r["amount"] for r in pg),
                      "매출액": rv, "매출원가": cg if kn else None, "매출총이익": (kn - cg) if kn else None,
                      "마진율": round((kn - cg) / kn * 100) if kn else None, "원가 미확인 매출": un or None,
                      "재고 금액": stock_val(its) or None})
@@ -2451,7 +2460,7 @@ def render_purchase_tab(ctx):
 
 
     with st.expander(f"📜 매입 내역 ({len(pur)}건)"):
-        wide(st.dataframe, pd.DataFrame([{"입고일": r["date"], "품명(매입)": r["name"], "연결 품목": disp(r["item"]) if r["item"] else "❌ 연결 안 됨",
+        wide(st.dataframe, pd.DataFrame([{"입고일": r["date"], "품명(매입)": r["name"], "연결 품목": disp(r["item"]) if r["item"] else ("(기타매출 직접 입력)" if r.get("manual") else "❌ 연결 안 됨"),
                                          "상품군": r["group"], "수량": r["qty"], "매입단가": r["unit"], "매입금액": r["amount"],
                                          } for r in sorted(pur, key=lambda x: x["date"], reverse=True)]),
              hide_index=True, column_config={"입고일": date_col("입고일"), "수량": num_col("수량"),
@@ -2767,15 +2776,16 @@ def purchase_template(item_names) -> bytes:
 
 def manual_template() -> bytes:
     import io
-    df = pd.DataFrame([{"날짜": today_kst(), "상품군": EXTRA_TARGET_GROUPS[0], "매출금액": 1000000, "메모": "예시 행 (지우고 쓰세요)"}])
+    df = pd.DataFrame([{"날짜": today_kst(), "상품군": EXTRA_TARGET_GROUPS[0], "매입금액": 800000, "매출금액": 1000000,
+                        "메모": "예시 행 (지우고 쓰세요)"}])
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         df.to_excel(xw, sheet_name="기타매출", index=False)
         ws = xw.sheets["기타매출"]
-        for col, w in zip("ABCD", (14, 18, 14, 24)):
+        for col, w in zip("ABCDE", (14, 18, 14, 14, 24)):
             ws.column_dimensions[col].width = w
         ws["A2"].number_format = "yyyy-mm-dd"
-        ws["C2"].number_format = "#,##0"
+        ws["C2"].number_format = ws["D2"].number_format = "#,##0"
     return buf.getvalue()
 
 
@@ -2861,7 +2871,8 @@ def build_notes(ctx):
         notes.append(f"이름이 달라 '유사'로 자동 매칭한 PO 품명 {len(ctx['fuzzy'])}개: {', '.join(ctx['fuzzy'])} (위 매칭 표에서 확인)")
     if wb.get("manual"):
         m = wb["manual"]
-        notes.append(f"엑셀 '기타매출' 시트에서 {len(m)}행, 합계 {won(sum(x['amount'] for x in m))}을 읽었습니다 "
+        notes.append(f"엑셀 '기타매출' 시트에서 {len(m)}행, 매출 합계 {won(sum(x['amount'] for x in m))}"
+                     + (f", 매입 합계 {won(sum(x['buy'] or 0 for x in m))}" if any(x.get('buy') for x in m) else "") + "을 읽었습니다 "
                      f"(상품군: {', '.join(sorted({x['group'] for x in m}))}).")
     if wb.get("targets"):
         notes.append(f"엑셀 '목표' 시트에서 {len(wb['targets'])}개월 목표를 읽었습니다.")
@@ -3041,7 +3052,7 @@ def main():
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.divider()
         sec("🧾 쿠팡 외 매출 직접 입력 ('기타매출' 시트)",
-            "네이버 두부모래처럼 쿠팡 PO가 아닌 매출은 마스터 엑셀에 '기타매출' 시트를 만들어 [날짜 | 상품군 | 매출금액]만 적으면 "
+            "네이버 두부모래처럼 쿠팡 PO가 아닌 매출은 마스터 엑셀에 '기타매출' 시트를 만들어 [날짜 | 상품군 | 매입금액 | 매출금액]을 적으면 "
             "실적으로 합산됩니다. 금액은 VAT 포함, 날짜 대신 '2026-10'처럼 월만 적어도 됩니다. 상품군을 비우면 '네이버 두부모래'로 봅니다.")
         st.download_button("⬇️ 기타매출 시트 템플릿 (.xlsx)", manual_template(), file_name="기타매출_템플릿.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
@@ -3095,6 +3106,11 @@ def main():
     for nm_ in {r["item"] for r in pur if r["item"]}:
         rs = [r for r in pur if r["item"] == nm_]
         unit_cost[nm_] = sum(r["amount"] for r in rs) / sum(r["qty"] for r in rs)     # 가중평균 매입단가
+    for x in wb.get("manual", []):                      # '기타매출' 시트의 매입금액 (수량 없이 금액만)
+        if x.get("buy"):
+            pur.append(dict(date=x["date"], name=x["group"], qty=0.0, unit=None, supplier="",
+                            amount=x["buy"] * (1.0 if x["group"] in TAX_EXEMPT_GROUPS else 1 / 1.1),
+                            item=None, group=x["group"], manual=True))
     po_by_name = {}
     for r in po_recs:
         po_by_name.setdefault(r["name"], []).append(r)
