@@ -479,7 +479,7 @@ def is_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> bool:
     return "매입" in sheet_name and "PO" not in sheet_name.upper()
 
 
-PARSER_VERSION = 12     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+PARSER_VERSION = 13     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -577,6 +577,7 @@ class Item:
     plan_until: object     # 예정 출고가 입력된 마지막 날짜 (없으면 None)
     sales: dict            # {날짜: 출고} 전 월 시트 합본 (PO 예측에 사용)
     policy: str = ""       # 공급 방식: "" 일반 발주 / "supply" 공장 공급 시 수령 / "mto" PO 맞춤 생산
+    po_fixed: dict = None  # VF형: {날짜: 수량} 쿠팡PO 탭의 확정 PO — 그 날짜에 평택→VF 입고 (이동 일수 없이 PO 날짜 = VF 입고일)
     po_sched: dict = None  # 밀크런: {날짜: 수량} 쿠팡PO 탭의 확정 PO + 이력 예측 PO (매일 평균 대신 이 날짜에 묶어서 출고)
 
 
@@ -694,6 +695,23 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
                 pipe = [(t, x) for t, x in pipe if t > i]
                 if log:
                     events.append((day, f"📥 [VF 도착] +{arr:,.0f}개 (쿠팡 PO 이동분)", main, vf))
+        fixed_today = (item.po_fixed or {}).get(day, 0.0) if not item.is_milkrun else 0.0
+        if fixed_today > 0:                                  # 확정 PO: PO 날짜에 바로 VF 입고 (같은 날 평택 입고분도 사용)
+            qty = min(fixed_today, main)
+            main -= qty
+            vf += qty
+            res["n_po"] += 1
+            res["first_po"] = res["first_po"] or day
+            if log:
+                events.append((day, f"📦 확정 쿠팡 PO: 평택 -{qty:,.0f}개 → VF 당일 입고"
+                               + (f" (요청 {fixed_today:,.0f}개 중 {fixed_today - qty:,.0f}개 부족)" if qty < fixed_today - 1e-9 else ""), main, vf))
+            if qty < fixed_today - 1e-9:
+                short_now = True
+                res["short_days"].append(i)
+                if res["stockout"] is None:
+                    res["stockout"] = i
+                    if log:
+                        events.append((day, "🚨 [평택 결품] 확정 쿠팡 PO를 채울 재고 부족", main, vf))
         demand = adu
         if item.plan_until and day <= item.plan_until:      # 예정 출고가 입력된 기간은 그 값을 그대로 사용
             demand = item.plan.get(day, 0.0)
@@ -723,9 +741,11 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
                     lost += demand - vf
                     vf = 0.0
                 transit = sum(x for _, x in pipe)
+                # 다음 확정 PO가 이동 일수 안에 잡혀 있으면 그 PO가 이번 보충분 → 추가 PO·결품 판정 안 함
+                pend = any(day < d_ <= day + timedelta(days=max(transfer_days, 1)) for d_ in (item.po_fixed or {}))
                 short_today = False
                 for _ in range(20):
-                    if vf + transit >= trig or main <= 1e-9:
+                    if pend or vf + transit >= trig or main <= 1e-9:
                         break
                     qty = main if item.moq_all else min(unit, main)
                     if not item.moq_all and main < unit:
@@ -743,7 +763,7 @@ def simulate(item: Item, base: date, adu: float, trig_mode: str, trig_value: flo
                         events.append((day, f"📦 쿠팡 PO: 평택 -{qty:,.0f}개 → VF{tag}", main, vf))
                     if item.moq_all:
                         break
-                if vf + transit < trig and main <= 1e-9:
+                if not pend and vf + transit < trig and main <= 1e-9:
                     short_today = True
                 if short_today:
                     short_now = True
@@ -2865,8 +2885,15 @@ def build_notes(ctx):
             notes.append(f"⚠️ [{p['name']}] 매입합계가 수량 × 단가와 달라서 수량 × 단가로 계산했어요 → {m_}. 엑셀 값을 확인해 주세요.")
         fut = [r for r in p["rows"] if r["date"] > base]
         if fut:
-            notes.append(f"[{p['name']}] 기준일({base:%m/%d}) 이후 날짜 입고 {len(fut)}행이 있어요 ({min(r['date'] for r in fut):%m/%d}~). "
-                         "실제 입고가 아니라 예정이라면 매입액·평균단가에 미리 들어가 있는 점 참고하세요.")
+            notes.append(f"[{p['name']}] 기준일({base:%m/%d}) 이후 날짜 {len(fut)}행은 입고 확정 수량으로 봅니다 "
+                         f"({min(r['date'] for r in fut):%m/%d}~). 매입액·평균단가에 포함됩니다.")
+    pc, pdup = ctx.get("pur_conf") or {}, ctx.get("pur_dup") or []
+    if pc:
+        notes.append("📦 평택입고 확정분을 재고 계산에 추가: " + ", ".join(
+            f"{disp(n)} {d:%m/%d} {q:,.0f}" for n, lst in pc.items() for d, q in lst))
+    if pdup:
+        notes.append("평택입고 확정분 중 월 시트 입고 스케줄과 같은 건은 중복이라 한 번만 반영: " + ", ".join(
+            f"{disp(r['item'])} {r['date']:%m/%d} {r['qty']:,.0f}" for r in pdup))
     pm = ctx.get("pmatch") or {}
     if pm:
         un = [k_ for k_, v_ in pm.items() if not v_[0]]
@@ -3144,20 +3171,6 @@ def main():
             nd = min(cands)
             next_po[f["item"].name] = min(n0, nd) if n0 else nd
 
-    sched = {}
-    for f in fcs:
-        if f["item"] is not None and f["item"].is_milkrun:
-            d_ = sched.setdefault(f["item"].name, {})
-            for e in f["events"]:
-                if e["kind"] in ("확정", "예측") and e["date"] > base:
-                    d_[e["date"]] = d_.get(e["date"], 0.0) + e["demand"]
-    items = [dataclasses.replace(i, po_sched=sched[i.name]) if i.name in sched else i for i in items]
-    calc = {}
-    for it in items:
-        sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
-        calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days, over_days))
-
-    set_short_names({i.name for i in items} | {f["name"] for f in fcs})
     pur = [dict(r) for p in wb.get("purchases", []) for r in p["rows"]]
     pmatch = auto_match(sorted({r["name"] for r in pur}), [i.name for i in items], exclusive=False) if pur else {}
     for r in pur:
@@ -3166,6 +3179,52 @@ def main():
         if not vat_incl and r["group"] not in TAX_EXEMPT_GROUPS:     # VAT 포함 끄면 장작 빼고 ÷1.1 (모든 시트 공통)
             r["amount"] /= 1.1
             r["unit"] = r["unit"] / 1.1 if r["unit"] else r["unit"]
+    # 평택입고 시트의 기준일 이후 날짜 = 입고 '확정' 수량 → 재고 시뮬레이션에 발주완료 입고로 반영
+    # (월 시트 입고 스케줄에 같은 수량이 ±14일 안에 이미 있으면 중복이라 건너뜀)
+    pur_conf, pur_dup = {}, []
+    for r in pur:
+        if r["item"] and r["date"] > base and r["qty"] > 0:
+            it_ = next((i for i in items if i.name == r["item"]), None)
+            if it_ is None:
+                continue
+            if any(abs(x["qty"] - r["qty"]) < 0.5 and abs((x["arrival"] - r["date"]).days) <= 14
+                   for x in it_.inbound_detail) or any(
+                   abs(q - r["qty"]) < 0.5 and d == r["date"] for d, q in pur_conf.get(it_.name, [])):
+                pur_dup.append(r)
+                continue
+            pur_conf.setdefault(it_.name, []).append((r["date"], r["qty"]))
+    if pur_conf:
+        new_items = []
+        for i in items:
+            add = pur_conf.get(i.name)
+            if add:
+                det = sorted(i.inbound_detail + [dict(arrival=d, qty=q, est=False, group="평택입고 확정", order=None, ordered=True)
+                                                 for d, q in add], key=lambda x: (x["arrival"], x["order"] or date.min))
+                i = dataclasses.replace(i, inbound=sorted(i.inbound + [(d, q, False) for d, q in add]), inbound_detail=det)
+            new_items.append(i)
+        items = new_items
+    sched = {}
+    for f in fcs:
+        if f["item"] is not None and f["item"].is_milkrun:
+            d_ = sched.setdefault(f["item"].name, {})
+            for e in f["events"]:
+                if e["kind"] in ("확정", "예측") and e["date"] > base:
+                    d_[e["date"]] = d_.get(e["date"], 0.0) + e["demand"]
+    items = [dataclasses.replace(i, po_sched=sched[i.name]) if i.name in sched else i for i in items]
+    fixed = {}
+    for f in fcs:
+        if f["item"] is not None and not f["item"].is_milkrun:
+            d_ = fixed.setdefault(f["item"].name, {})
+            for e in f["events"]:
+                if e["kind"] == "확정" and e["date"] > base:
+                    d_[e["date"]] = d_.get(e["date"], 0.0) + e["demand"]
+    items = [dataclasses.replace(i, po_fixed=fixed[i.name]) if fixed.get(i.name) else i for i in items]
+    calc = {}
+    for it in items:
+        sim = simulate(it, base, it.adu, trig_mode, trig_value, po_mult, transfer_days)
+        calc[it.name] = (sim, evaluate(it, sim, base, it.adu, it.safety, it.lt, target_days, over_days))
+
+    set_short_names({i.name for i in items} | {f["name"] for f in fcs})
     unit_cost = {}
     for nm_ in {r["item"] for r in pur if r["item"]}:
         rs = [r for r in pur if r["item"] == nm_]
@@ -3184,7 +3243,8 @@ def main():
                po_by_name=po_by_name, deadlines={n: c_[1] for n, c_ in calc.items()},
                months=months_span(fcs, base, horizon_end) if fcs else [], stale_days=stale,
                sheets=sheets, wb=wb, po_recs=po_recs, po_names=po_names, mapping=mapping, overrides=overrides,
-               excluded=excluded, latest=latest, purchases=pur, pmatch=pmatch, unit_cost=unit_cost)
+               excluded=excluded, latest=latest, purchases=pur, pmatch=pmatch, unit_cost=unit_cost,
+               pur_conf=pur_conf, pur_dup=pur_dup)
     ctx["inv_df"] = inventory_table(ctx)
 
     unmatched = [p for p in po_names if p not in mapping]
