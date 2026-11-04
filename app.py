@@ -242,19 +242,21 @@ def parse_sheet(raw: pd.DataFrame, sheet_name: str, fallback_year: int) -> dict:
     for c in range(n_cols):
         pieces = [raw.iat[r, c] for r in range(data_start)]
         joined = "|".join(clean_txt(p) for p in pieces)
-        if "입고일" not in joined:
+        a_m = re.search(r"(입고일|입항일|도착일|입고예정일?)[:：]?([^|]*)", joined)     # '입고일'·'입항일' 둘 다
+        if not a_m:
             continue
-        a_txt = re.search(r"입고일[:：]?([^|]*)", joined).group(1)
+        a_txt, port = a_m.group(2), a_m.group(1) == "입항일"
         o_m = re.search(r"발주일[:：]?([^|]*)", joined)
         order, o_est = (parse_kr_date(o_m.group(1), anchor) if o_m else (None, False))
         arrival, a_est = parse_kr_date(a_txt, anchor, not_before=order)
         group = next((re.sub(r"\s+", " ", str(p)).strip() for p in pieces
-                      if clean_txt(p) and "발주일" not in clean_txt(p) and "입고일" not in clean_txt(p)), "미분류")
+                      if clean_txt(p) and "발주일" not in clean_txt(p)
+                      and not re.search(r"입고일|입항일|도착일|입고예정", clean_txt(p))), "미분류")
         if arrival is None:
             unparsed.append(f"{group} / {a_txt}")
             continue
         inbound_cols.append(dict(col=c, group=group, order=order, arrival=arrival, est=bool(o_est or a_est), arr_est=a_est,
-                                 raw_order=(o_m.group(1) if o_m else ""), raw_arrival=a_txt))
+                                 raw_order=(o_m.group(1) if o_m else ""), raw_arrival=a_txt, port=port))
 
     # 품목 행
     rows, valid_idx = [], []
@@ -433,7 +435,7 @@ def parse_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> dict:
     miss = [k for k, v in (("입고일", c_d), ("품명", c_n), ("수량", c_q)) if v is None]
     if miss or (c_u is None and c_a is None):
         raise ValueError(f"매입 시트에서 {', '.join(miss) or '매입단가/매입금액'} 칸을 찾지 못했습니다.")
-    recs, bad = [], 0
+    recs, bad, mism = [], 0, []
     for r in range(hr + 1, n):
         nm = raw.iat[r, c_n]
         if not clean_txt(nm):
@@ -445,6 +447,8 @@ def parse_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> dict:
         if d is None and clean_txt(dv):
             d = parse_kr_date(str(dv), today_kst())[0]
         q = to_num(raw.iat[r, c_q])
+        if q == 0:                                              # 수량 0인 줄은 입고 없음 → 조용히 건너뜀
+            continue
         u = to_num(raw.iat[r, c_u]) if c_u is not None else None
         a = to_num(raw.iat[r, c_a]) if c_a is not None else None
         if d is None or not q:
@@ -454,13 +458,16 @@ def parse_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> dict:
             a = u * q
         if u is None and a is not None:
             u = a / q
+        if u is not None and a is not None and abs(a - u * q) > max(1.0, abs(u * q) * 0.005):   # 합계 오타 → 수량 × 단가 사용
+            mism.append(f"{d:%m/%d} {str(nm).strip()}: {q:,.0f} × {u:,.0f} = {u * q:,.0f}인데 합계 {a:,.0f}")
+            a = u * q
         if a is None:
             bad += 1
             continue
         sup = raw.iat[r, c_s] if c_s is not None else None
         recs.append(dict(date=d, name=re.sub(r"\s+", " ", str(nm)).strip(), qty=q, unit=u, amount=a,
                          supplier=str(sup).strip() if clean_txt(sup) else ""))
-    return dict(name=sheet_name, rows=recs, bad=bad)
+    return dict(name=sheet_name, rows=recs, bad=bad, mismatch=mism)
 
 
 def is_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> bool:
@@ -472,7 +479,7 @@ def is_purchase_sheet(raw: pd.DataFrame, sheet_name: str) -> bool:
     return "매입" in sheet_name and "PO" not in sheet_name.upper()
 
 
-PARSER_VERSION = 10     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
+PARSER_VERSION = 12     # 파싱 결과 구조를 바꿀 때마다 올리면 Streamlit이 예전 캐시를 버리고 다시 파싱함
 
 
 @st.cache_data(show_spinner="엑셀 분석 중...")
@@ -503,6 +510,23 @@ def as_date(v):
     if v is None or (not isinstance(v, (date, datetime)) and pd.isna(v)):
         return None
     return v.date() if isinstance(v, datetime) else (v if isinstance(v, date) else None)
+
+
+def shift_port_arrivals(sheets: list, days: int) -> list:
+    """'입항일'로 적힌 입고 컬럼은 항구 도착일이라, 통관·운송 일수만큼 평택 입고일을 뒤로 민다."""
+    if not days:
+        return sheets
+    out = []
+    for sh in sheets:
+        ports = {c["col"] for c in sh["inbound_cols"] if c.get("port")}
+        if not ports:
+            out.append(sh)
+            continue
+        cols = [dict(c, arrival=c["arrival"] + timedelta(days=days)) if c["col"] in ports else c for c in sh["inbound_cols"]]
+        rows = [dict(r, inbound=[(a + timedelta(days=days) if col in ports else a, q, e, g, o, col)
+                                 for (a, q, e, g, o, col) in r["inbound"]]) for r in sh["rows"]]
+        out.append(dict(sh, inbound_cols=cols, rows=rows))
+    return out
 
 
 def apply_inbound_overrides(sheets: list, sheet_name: str, overrides: dict) -> list:
@@ -879,8 +903,33 @@ def norm_name(s) -> str:
     return re.sub(r"[\s,.\[\]()（）_+\-/·]", "", str(s)).lower()
 
 
-def auto_match(po_names, item_names) -> dict:
-    """PO 품명 → (재고시트 품명 또는 None, 매칭 방식). 공백·기호를 뺀 이름이 같으면 일치, 아니면 유사도 60% 이상 1순위."""
+_SPEC_PATS = [("size", r"초소형|특대형|(?<!초)소형|중형|(?<!특)대형"), ("sex", r"남아|여아"),
+              ("code", r"A\d{3}"), ("color", r"크림화이트|딥블랙|로즈골드|올리브그린|베이지|그레이|(?<!크림)화이트|(?<!딥)블랙")]
+_SPEC_UNIT = re.compile(r"(\d+(?:\.\d+)?)(매|kg|cm|인치|p|개|종|L|ml)")
+
+
+def spec_tokens(name: str) -> dict:
+    """사이즈·성별·용량·색상처럼 품목을 가르는 말 {종류: 값}."""
+    t = re.sub(r"\s+", "", str(name)).replace("남아용", "남아").replace("여아용", "여아")
+    out = {}
+    for k, p in _SPEC_PATS:
+        m = re.findall(p, t)
+        if m:
+            out[k] = frozenset(m)
+    for num, unit in _SPEC_UNIT.findall(t):
+        out.setdefault("u:" + unit, set()).add(num)
+    return {k: frozenset(v) for k, v in out.items()}
+
+
+def spec_conflict(a: str, b: str) -> bool:
+    """두 이름에 같은 종류(사이즈, 성별, 용량…)가 둘 다 있는데 값이 다르면 다른 품목."""
+    sa, sb = spec_tokens(a), spec_tokens(b)
+    return any(sa[k] != sb[k] for k in sa.keys() & sb.keys())
+
+
+def auto_match(po_names, item_names, exclusive=True) -> dict:
+    """PO 품명 → (재고시트 품명 또는 None, 매칭 방식). 공백·기호를 뺀 이름이 같으면 일치, 아니면 유사도 60% 이상 1순위.
+    유사 매칭은 사이즈·성별·용량·색상(spec_tokens)이 같은 품목끼리만. exclusive=False면 이미 일치로 쓰인 품목에도 연결(매입처럼 여러 이름 → 한 품목)."""
     by_norm = {}
     for n in item_names:
         by_norm.setdefault(norm_name(n), n)
@@ -890,12 +939,13 @@ def auto_match(po_names, item_names) -> dict:
         if n:
             out[p] = (n, "일치")
             used.add(n)
-    rest = [n for n in item_names if n not in used]
+    rest = [n for n in item_names if n not in used] if exclusive else list(item_names)
     for p in po_names:
         if p in out:
             continue
         k = norm_name(p)
-        scored = sorted(((difflib.SequenceMatcher(None, k, norm_name(n)).ratio(), n) for n in rest), reverse=True)
+        scored = sorted(((difflib.SequenceMatcher(None, k, norm_name(n)).ratio(), n) for n in rest
+                         if not spec_conflict(p, n)), reverse=True)
         if scored and scored[0][0] >= 0.6 and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.05):
             out[p] = (scored[0][1], f"유사 {scored[0][0]:.0%}")
         else:
@@ -2811,6 +2861,12 @@ def build_notes(ctx):
     notes = []
     for p in wb.get("purchases", []):
         notes.append(f"[{p['name']}] 매입 {len(p['rows'])}행 인식" + (f", 날짜·수량·금액을 못 읽은 행 {p['bad']}개 제외" if p["bad"] else ""))
+        for m_ in p.get("mismatch", []):
+            notes.append(f"⚠️ [{p['name']}] 매입합계가 수량 × 단가와 달라서 수량 × 단가로 계산했어요 → {m_}. 엑셀 값을 확인해 주세요.")
+        fut = [r for r in p["rows"] if r["date"] > base]
+        if fut:
+            notes.append(f"[{p['name']}] 기준일({base:%m/%d}) 이후 날짜 입고 {len(fut)}행이 있어요 ({min(r['date'] for r in fut):%m/%d}~). "
+                         "실제 입고가 아니라 예정이라면 매입액·평균단가에 미리 들어가 있는 점 참고하세요.")
     pm = ctx.get("pmatch") or {}
     if pm:
         un = [k_ for k_, v_ in pm.items() if not v_[0]]
@@ -2944,6 +3000,8 @@ def main():
         transfer_days = st.number_input("평택→VF 이동 소요일", 0, 14, 0)
         target_days = st.number_input("권장 발주량 산정 기간 (일)", 7, 120, 45)
         over_days = st.number_input("과재고 기준 (재고커버 일수, PO 맞춤 생산 품목)", 14, 365, 60)
+        port_days = st.number_input("입항일 → 평택 입고까지 (일)", 0, 30, 0,
+                                    help="엑셀 입고 스케줄에 '입항일'로 적힌 경우, 통관·운송에 걸리는 날만큼 평택 입고일을 뒤로 미룹니다.")
         use_plan = st.checkbox("시트에 미리 입력된 미래 출고 반영", True)
         include_stale = st.checkbox("최신 월 시트에 없는 품목도 포함", False)
     with st.sidebar.expander("⚙️ 고급 설정 · PO 예측"):
@@ -2989,7 +3047,7 @@ def main():
                     overrides[col_idx] = (o_new, a_new)
         else:
             st.caption("최신 월 시트에 입고 스케줄 컬럼이 없습니다.")
-    sheets = apply_inbound_overrides(sheets, latest_sheet["name"], overrides)
+    sheets = apply_inbound_overrides(shift_port_arrivals(sheets, int(port_days)), latest_sheet["name"], overrides)
 
     items, latest, entered, lt_est = build_items(
         sheets, base, win_std, win_mr, default_lt, use_hist_lt, mr_kw, include_stale, use_plan)
@@ -3101,7 +3159,7 @@ def main():
 
     set_short_names({i.name for i in items} | {f["name"] for f in fcs})
     pur = [dict(r) for p in wb.get("purchases", []) for r in p["rows"]]
-    pmatch = auto_match(sorted({r["name"] for r in pur}), [i.name for i in items]) if pur else {}
+    pmatch = auto_match(sorted({r["name"] for r in pur}), [i.name for i in items], exclusive=False) if pur else {}
     for r in pur:
         r["item"] = pmatch[r["name"]][0]
         r["group"] = group_of(r["item"] or r["name"], rules)
