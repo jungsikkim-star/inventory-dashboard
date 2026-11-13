@@ -2483,8 +2483,19 @@ def render_purchase_tab(ctx):
         rows.append({"상품군": g, "매입수량": sum(r["qty"] for r in pg) or None, "매입액": sum(r["amount"] for r in pg),
                      "매출액": rv, "매출원가": cg if kn else None, "매출총이익": (kn - cg) if kn else None,
                      "마진율": round((kn - cg) / kn * 100) if kn else None, "원가 미확인 매출": un or None,
-                     "평택 재고 금액": stock_val(its) or None})
+                     "평택 재고 금액": stock_val(its) or None, "_kn": kn})
     if rows:
+        def _sum(k):
+            v = sum(r_[k] or 0 for r_ in rows)
+            return v or None
+        tk, tc = _sum("_kn") or 0, _sum("매출원가") or 0
+        rows.append({"상품군": "합계", "매입수량": None,       # 상품군마다 단위(BOX·개)가 달라 수량은 합산 안 함
+                     "매입액": _sum("매입액") or 0, "매출액": _sum("매출액") or 0,
+                     "매출원가": tc or None, "매출총이익": (tk - tc) if tk else None,
+                     "마진율": round((tk - tc) / tk * 100) if tk else None,
+                     "원가 미확인 매출": _sum("원가 미확인 매출"), "평택 재고 금액": _sum("평택 재고 금액"), "_kn": tk})
+        for r_ in rows:
+            r_.pop("_kn")
         wide(st.dataframe, pd.DataFrame(rows), hide_index=True,
              column_config={**{c_: num_col(c_) for c_ in ("매입수량", "매입액", "매출액", "매출원가", "매출총이익",
                                                           "원가 미확인 매출", "평택 재고 금액")},
