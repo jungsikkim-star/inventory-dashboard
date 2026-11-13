@@ -1186,6 +1186,10 @@ def wide(fn, *args, **kw):
     """Streamlit 버전별 '가로 꽉 채우기' 인자 차이 흡수. 표는 칸 서식을 먼저 적용."""
     if fn is st.dataframe and args and isinstance(args[0], pd.DataFrame):
         df, cc = _prep_table(args[0], kw.get("column_config"))
+        if kw.pop("total_row", False) and len(df):      # 마지막 행(합계)을 색·굵기로 구분
+            last = df.index[-1]
+            df = df.style.apply(lambda r: ["background-color: #DCE6F2; color: #1F4E79; font-weight: 700"
+                                           if r.name == last else "" for _ in r], axis=1)
         args = (df,) + args[1:]
         kw["column_config"] = cc
     order = ({"width": "stretch"}, {"use_container_width": True}) if _ST_VER >= (1, 50) \
@@ -2496,7 +2500,7 @@ def render_purchase_tab(ctx):
                      "원가 미확인 매출": _sum("원가 미확인 매출"), "평택 재고 금액": _sum("평택 재고 금액"), "_kn": tk})
         for r_ in rows:
             r_.pop("_kn")
-        wide(st.dataframe, pd.DataFrame(rows), hide_index=True,
+        wide(st.dataframe, pd.DataFrame(rows), hide_index=True, total_row=True,
              column_config={**{c_: num_col(c_) for c_ in ("매입수량", "매입액", "매출액", "매출원가", "매출총이익",
                                                           "원가 미확인 매출", "평택 재고 금액")},
                             "마진율": pct_col("마진율", 100)})
